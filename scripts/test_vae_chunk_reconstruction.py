@@ -25,11 +25,11 @@ def to_uint8_video(video_btchw: torch.Tensor) -> torch.Tensor:
     return video.permute(0, 2, 3, 1).contiguous()
 
 
-def decode_latent_chunked(vae: WanVAEWrapper, latent: torch.Tensor, chunk_size: int) -> torch.Tensor:
+def decode_latent_chunked(vae: WanVAEWrapper, latent: torch.Tensor, chunk_size: int, decode_dtype: torch.dtype) -> torch.Tensor:
     """Mirror DMDRL chunked decode behavior."""
 
     def _decode(lat):
-        return vae.decode_to_pixel(lat)
+        return vae.decode_to_pixel(lat.to(dtype=decode_dtype))
 
     if chunk_size <= 0 or chunk_size >= latent.shape[1]:
         return checkpoint_utils.checkpoint(_decode, latent, use_reentrant=False)
@@ -89,8 +89,13 @@ def main():
         model_input = to_model_input(video).to(device=device, dtype=torch.bfloat16)
         latent = vae.encode_to_latent(model_input)
 
+        # WanVAEWrapper.encode_to_latent returns float tensor; ensure decode input dtype
+        # matches VAE module dtype to avoid conv3d dtype mismatch (float vs bf16).
+        decode_dtype = next(vae.model.parameters()).dtype
+        latent = latent.to(dtype=decode_dtype)
+
         recon_full = vae.decode_to_pixel(latent)
-        recon_chunk = decode_latent_chunked(vae, latent, args.chunk_size)
+        recon_chunk = decode_latent_chunked(vae, latent, args.chunk_size, decode_dtype=decode_dtype)
 
     recon_full_u8 = to_uint8_video(recon_full)
     recon_chunk_u8 = to_uint8_video(recon_chunk)
