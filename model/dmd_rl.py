@@ -52,6 +52,10 @@ class DMDRL(DMD):
         # 0 = no sampling (use all frames)
         self.rl_reward_num_frames = getattr(args, "rl_reward_num_frames", 10)
 
+        # VAE decode chunking: decode latent frames in smaller temporal chunks
+        # 0 = no chunking (decode all frames at once)
+        self.vae_chunk_size = getattr(args, "vae_chunk_size", 0)
+
         # Reward normalization: use inference_config from reward model checkpoint
         # (VQ_mean/std, MQ_mean/std, TA_mean/std) for proper z-score normalization
         # These are loaded lazily when the reward model is initialized
@@ -229,7 +233,8 @@ class DMDRL(DMD):
 
     def _decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode all latent frames to pixel space with gradient checkpointing.
+        Decode latent frames to pixel space with gradient checkpointing.
+        Supports optional temporal chunking via `vae_chunk_size`.
 
         Args:
             latent: [B, T, C, H, W] full latent tensor (e.g., T=21)
@@ -240,9 +245,22 @@ class DMDRL(DMD):
         def _decode(lat):
             return self.vae.decode_to_pixel(lat)
 
-        return checkpoint_utils.checkpoint(
-            _decode, latent, use_reentrant=False
-        )
+        chunk_size = int(self.vae_chunk_size) if self.vae_chunk_size is not None else 0
+        if chunk_size <= 0 or chunk_size >= latent.shape[1]:
+            return checkpoint_utils.checkpoint(
+                _decode, latent, use_reentrant=False
+            )
+
+        decoded_chunks = []
+        for start in range(0, latent.shape[1], chunk_size):
+            end = min(start + chunk_size, latent.shape[1])
+            latent_chunk = latent[:, start:end]
+            pixel_chunk = checkpoint_utils.checkpoint(
+                _decode, latent_chunk, use_reentrant=False
+            )
+            decoded_chunks.append(pixel_chunk)
+
+        return torch.cat(decoded_chunks, dim=1)
 
     def compute_rl_loss(
         self,
