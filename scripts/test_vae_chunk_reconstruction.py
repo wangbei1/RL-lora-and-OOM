@@ -67,6 +67,13 @@ def main():
     )
     parser.add_argument("--chunk_size", type=int, default=1, help="Temporal latent chunk size for decode")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--autocast_dtype",
+        type=str,
+        default="bf16",
+        choices=["none", "bf16", "fp16"],
+        help="Autocast dtype for VAE encode/decode on CUDA",
+    )
     parser.add_argument("--out_dir", type=str, default="artifacts/vae_chunk_test")
     parser.add_argument("--max_frames", type=int, default=0, help="0 means use all frames")
     args = parser.parse_args()
@@ -85,17 +92,30 @@ def main():
     device = torch.device(args.device)
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16)
 
+    autocast_enabled = (device.type == "cuda") and (args.autocast_dtype != "none")
+    if args.autocast_dtype == "bf16":
+        autocast_dtype = torch.bfloat16
+    elif args.autocast_dtype == "fp16":
+        autocast_dtype = torch.float16
+    else:
+        autocast_dtype = torch.float32
+
     with torch.no_grad():
-        model_input = to_model_input(video).to(device=device, dtype=torch.bfloat16)
-        latent = vae.encode_to_latent(model_input)
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=autocast_dtype,
+            enabled=autocast_enabled,
+        ):
+            model_input = to_model_input(video).to(device=device, dtype=torch.bfloat16)
+            latent = vae.encode_to_latent(model_input)
 
-        # WanVAEWrapper.encode_to_latent returns float tensor; ensure decode input dtype
-        # matches VAE module dtype to avoid conv3d dtype mismatch (float vs bf16).
-        decode_dtype = next(vae.model.parameters()).dtype
-        latent = latent.to(dtype=decode_dtype)
+            # WanVAEWrapper.encode_to_latent returns float tensor; ensure decode input dtype
+            # matches VAE module dtype to avoid conv3d dtype mismatch (float vs bf16).
+            decode_dtype = next(vae.model.parameters()).dtype
+            latent = latent.to(dtype=decode_dtype)
 
-        recon_full = vae.decode_to_pixel(latent)
-        recon_chunk = decode_latent_chunked(vae, latent, args.chunk_size, decode_dtype=decode_dtype)
+            recon_full = vae.decode_to_pixel(latent)
+            recon_chunk = decode_latent_chunked(vae, latent, args.chunk_size, decode_dtype=decode_dtype)
 
     recon_full_u8 = to_uint8_video(recon_full)
     recon_chunk_u8 = to_uint8_video(recon_chunk)
@@ -111,6 +131,7 @@ def main():
     print("=== Reconstruction Metrics ===")
     print(f"Input video: {args.video_path}")
     print(f"Chunk size: {args.chunk_size}")
+    print(f"Autocast: enabled={autocast_enabled}, dtype={args.autocast_dtype}")
     print(f"Saved full recon : {out_full}")
     print(f"Saved chunk recon: {out_chunk}")
     print("--- Original vs Chunked-Recon ---")
