@@ -251,15 +251,17 @@ class DMDRL(DMD):
                 _decode, latent, use_reentrant=False
             )
 
+        # Keep decode cache continuous across temporal chunks.
+        # This reduces boundary mismatch compared to decoding each chunk independently.
+        self.vae.model.clear_cache()
         decoded_chunks = []
         for start in range(0, latent.shape[1], chunk_size):
             end = min(start + chunk_size, latent.shape[1])
             latent_chunk = latent[:, start:end]
-            pixel_chunk = checkpoint_utils.checkpoint(
-                _decode, latent_chunk, use_reentrant=False
-            )
+            pixel_chunk = self.vae.decode_to_pixel(latent_chunk, use_cache=True)
             decoded_chunks.append(pixel_chunk)
 
+        self.vae.model.clear_cache()
         return torch.cat(decoded_chunks, dim=1)
 
     def compute_rl_loss(
