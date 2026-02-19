@@ -39,6 +39,17 @@ def frame_metrics(a: torch.Tensor, b: torch.Tensor) -> List[dict]:
     return out
 
 
+def build_abs_diff_video(a: torch.Tensor, b: torch.Tensor, amplify: float = 1.0) -> torch.Tensor:
+    """Build uint8 absolute-difference video for visualization.
+
+    Args:
+        a, b: [T,H,W,C] uint8 clips with same shape.
+        amplify: multiply absolute error before clipping to [0,255].
+    """
+    diff = (a.float() - b.float()).abs() * amplify
+    return diff.clamp(0, 255).round().to(torch.uint8)
+
+
 def main():
     parser = argparse.ArgumentParser("Verify causal VAE latent-window decoding alignment")
     parser.add_argument(
@@ -69,6 +80,12 @@ def main():
         help="Maximum full-decode start index (inclusive) used when --auto_scan is enabled; -1 means auto",
     )
     parser.add_argument("--out_dir", type=str, default="artifacts/causal_vae_verify")
+    parser.add_argument(
+        "--diff_amplify",
+        type=float,
+        default=1.0,
+        help="Amplification factor for saved absolute-difference video",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.video_path):
@@ -127,6 +144,8 @@ def main():
     write_video(os.path.join(args.out_dir, "part_decode.mp4"), part_u8, fps=fps)
     write_video(os.path.join(args.out_dir, "full_clip_for_compare.mp4"), full_clip, fps=fps)
     write_video(os.path.join(args.out_dir, "part_clip_tail_for_compare.mp4"), part_clip, fps=fps)
+    diff_clip = build_abs_diff_video(full_clip, part_clip, amplify=args.diff_amplify)
+    write_video(os.path.join(args.out_dir, "abs_diff_clip.mp4"), diff_clip, fps=fps)
 
     print("=== Causal VAE alignment verification ===")
     print(f"video_path     : {args.video_path}")
@@ -139,6 +158,7 @@ def main():
         print(f"scan range     : [{scan_min}, {scan_max}]")
     print(f"full frame idx : [{full_start}, {full_start + args.compare_len})")
     print(f"compare        : part_tail(last {args.compare_len}) vs full segment")
+    print(f"diff amplify   : {args.diff_amplify}")
     print(f"full_decode frames: {full_u8.shape[0]}")
     print(f"part_decode frames: {part_u8.shape[0]}")
     print("--- aggregate ---")
