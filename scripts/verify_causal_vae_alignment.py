@@ -51,6 +51,23 @@ def main():
     parser.add_argument("--latent_end", type=int, default=5, help="exclusive latent index")
     parser.add_argument("--full_start", type=int, default=10, help="full decode start frame index")
     parser.add_argument("--compare_len", type=int, default=4, help="number of frames to compare")
+    parser.add_argument(
+        "--auto_scan",
+        action="store_true",
+        help="Automatically scan full-decode offsets and pick best alignment for part tail clip",
+    )
+    parser.add_argument(
+        "--scan_min_start",
+        type=int,
+        default=0,
+        help="Minimum full-decode start index used when --auto_scan is enabled",
+    )
+    parser.add_argument(
+        "--scan_max_start",
+        type=int,
+        default=-1,
+        help="Maximum full-decode start index (inclusive) used when --auto_scan is enabled; -1 means auto",
+    )
     parser.add_argument("--out_dir", type=str, default="artifacts/causal_vae_verify")
     args = parser.parse_args()
 
@@ -78,8 +95,28 @@ def main():
     full_u8 = to_uint8_video(full_pix)
     part_u8 = to_uint8_video(part_pix)
 
-    full_clip = full_u8[args.full_start:args.full_start + args.compare_len]
     part_clip = part_u8[-args.compare_len:]
+
+    if args.auto_scan:
+        max_valid_start = full_u8.shape[0] - args.compare_len
+        scan_min = max(0, args.scan_min_start)
+        scan_max = max_valid_start if args.scan_max_start < 0 else min(args.scan_max_start, max_valid_start)
+        if scan_min > scan_max:
+            raise ValueError(f"Invalid scan range: [{scan_min}, {scan_max}] for full length {full_u8.shape[0]}")
+
+        best = None
+        for start in range(scan_min, scan_max + 1):
+            cand = full_u8[start:start + args.compare_len]
+            cand_mse = torch.mean((cand.float() - part_clip.float()) ** 2).item()
+            cand_mae = torch.mean(torch.abs(cand.float() - part_clip.float())).item()
+            if best is None or cand_mse < best["mse"]:
+                best = {"start": start, "mse": cand_mse, "mae": cand_mae}
+
+        full_start = best["start"]
+    else:
+        full_start = args.full_start
+
+    full_clip = full_u8[full_start:full_start + args.compare_len]
 
     metrics = frame_metrics(full_clip, part_clip)
     mse = torch.mean((full_clip.float() - part_clip.float()) ** 2).item()
@@ -94,7 +131,13 @@ def main():
     print("=== Causal VAE alignment verification ===")
     print(f"video_path     : {args.video_path}")
     print(f"latent range   : [{args.latent_start}, {args.latent_end})")
-    print(f"full frame idx : [{args.full_start}, {args.full_start + args.compare_len})")
+    print(f"auto_scan      : {args.auto_scan}")
+    if args.auto_scan:
+        max_valid_start = full_u8.shape[0] - args.compare_len
+        scan_min = max(0, args.scan_min_start)
+        scan_max = max_valid_start if args.scan_max_start < 0 else min(args.scan_max_start, max_valid_start)
+        print(f"scan range     : [{scan_min}, {scan_max}]")
+    print(f"full frame idx : [{full_start}, {full_start + args.compare_len})")
     print(f"compare        : part_tail(last {args.compare_len}) vs full segment")
     print(f"full_decode frames: {full_u8.shape[0]}")
     print(f"part_decode frames: {part_u8.shape[0]}")
