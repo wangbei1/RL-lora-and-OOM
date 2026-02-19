@@ -52,6 +52,13 @@ class DMDRL(DMD):
         # 0 = no sampling (use all frames)
         self.rl_reward_num_frames = getattr(args, "rl_reward_num_frames", 10)
 
+        # Reward-frame construction strategy:
+        # - full_decode_uniform: decode full latent video, then uniformly sample frames
+        # - sparse_window_tail: decode only small latent windows and keep each window tail frame
+        self.rl_frame_strategy = getattr(args, "rl_frame_strategy", "full_decode_uniform")
+        self.rl_sparse_num_groups = getattr(args, "rl_sparse_num_groups", 4)
+        self.rl_sparse_window_back = getattr(args, "rl_sparse_window_back", 4)
+
         # VAE decode chunking: decode latent frames in smaller temporal chunks
         # 0 = no chunking (decode all frames at once)
         self.vae_chunk_size = getattr(args, "vae_chunk_size", 0)
@@ -264,6 +271,55 @@ class DMDRL(DMD):
         self.vae.model.clear_cache()
         return torch.cat(decoded_chunks, dim=1)
 
+    def _build_sparse_latent_indices(self, num_latent_frames: int) -> list:
+        """
+        Build sparse latent indices for window-tail decoding.
+        Example for 21 latent frames and 4 groups: [0, 5, 10, 15, 20].
+        """
+        if num_latent_frames <= 1:
+            return [0]
+
+        tail = num_latent_frames - 1
+        num_groups = max(int(self.rl_sparse_num_groups), 1)
+
+        indices = [0]
+        for g in range(1, num_groups + 1):
+            idx = int(round(g * tail / num_groups))
+            idx = min(max(idx, 0), num_latent_frames - 1)
+            indices.append(idx)
+
+        indices = sorted(set(indices))
+        return indices
+
+    def _decode_sparse_window_tail_frames(self, single_latent: torch.Tensor) -> torch.Tensor:
+        """
+        Decode sparse latent windows and keep each window's last decoded pixel frame.
+
+        Args:
+            single_latent: [T, C, H, W]
+
+        Returns:
+            sampled_pixel_frames: [K, C, H, W]
+        """
+        indices = self._build_sparse_latent_indices(single_latent.shape[0])
+        output_frames = []
+
+        for idx in indices:
+            start = max(0, idx - int(self.rl_sparse_window_back))
+            end = idx + 1
+            window_latent = single_latent[start:end].unsqueeze(0)  # [1, Tw, C, H, W]
+
+            # Decode this local window and keep only the tail frame.
+            window_pixels = self.vae.decode_to_pixel(window_latent, use_cache=False)[0]  # [Tp, C, H, W]
+            output_frames.append(window_pixels[-1])
+
+        sampled = torch.stack(output_frames, dim=0)
+
+        # Reward model requires an even number of frames (temporal_patch_size=2).
+        if sampled.shape[0] % 2 != 0:
+            sampled = torch.cat([sampled, sampled[-1:]], dim=0)
+        return sampled
+
     def compute_rl_loss(
         self,
         latent: torch.Tensor,
@@ -297,8 +353,10 @@ class DMDRL(DMD):
 
         batch_size = latent.shape[0]
 
-        # Step 1: Decode all latent frames to pixel space with checkpoint
-        pixel_video = self._decode_latent(latent)
+        pixel_video = None
+        if self.rl_frame_strategy == "full_decode_uniform":
+            # Step 1: Decode all latent frames to pixel space
+            pixel_video = self._decode_latent(latent)
 
         # Compute rewards for each sample in the batch
         total_reward = 0.0
@@ -306,10 +364,11 @@ class DMDRL(DMD):
         normalized_rewards_list = []
 
         for i in range(batch_size):
-            single_video = pixel_video[i]  # [T_decoded, 3, H, W]
-
-            # Step 2: Sub-sample pixel frames for reward model
-            sampled_video = self._sample_frames(single_video)
+            if self.rl_frame_strategy == "sparse_window_tail":
+                sampled_video = self._decode_sparse_window_tail_frames(latent[i])
+            else:
+                single_video = pixel_video[i]  # [T_decoded, 3, H, W]
+                sampled_video = self._sample_frames(single_video)
 
             prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
 
