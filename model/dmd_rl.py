@@ -310,7 +310,11 @@ class DMDRL(DMD):
             window_latent = single_latent[start:end].unsqueeze(0)  # [1, Tw, C, H, W]
 
             # Decode this local window and keep only the tail frame.
-            window_pixels = self.vae.decode_to_pixel(window_latent, use_cache=False)[0]  # [Tp, C, H, W]
+            window_pixels = checkpoint_utils.checkpoint(
+                lambda x: self.vae.decode_to_pixel(x, use_cache=False),
+                window_latent,
+                use_reentrant=False,
+            )[0]  # [Tp, C, H, W]
             output_frames.append(window_pixels[-1])
 
         sampled = torch.stack(output_frames, dim=0)
