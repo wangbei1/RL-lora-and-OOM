@@ -26,8 +26,8 @@ text_encoder_fsdp_wrap_strategy: size
 generator_cpu_offload: true
 real_score_cpu_offload: true
 fake_score_cpu_offload: true
-text_encoder_cpu_offload: true
-rl_reward_cpu_offload: true
+text_encoder_cpu_offload: false
+rl_reward_cpu_offload: false
 
 # Model names
 real_name: Wan2.1-T2V-14B
