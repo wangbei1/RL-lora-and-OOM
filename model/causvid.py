@@ -25,6 +25,9 @@ class CausVid(BaseModel):
         if args.gradient_checkpointing:
             self.generator.enable_gradient_checkpointing()
             self.fake_score.enable_gradient_checkpointing()
+            # real_score is frozen, but gradients still flow through it to generator inputs.
+            # Enabling checkpointing here reduces activation memory in its forward pass.
+            self.real_score.enable_gradient_checkpointing()
 
         # Step 2: Initialize all dmd hyperparameters
         self.num_train_timestep = args.num_train_timestep

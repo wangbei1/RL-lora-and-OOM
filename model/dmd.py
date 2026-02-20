@@ -27,6 +27,9 @@ class DMD(SelfForcingModel):
         if args.gradient_checkpointing:
             self.generator.enable_gradient_checkpointing()
             self.fake_score.enable_gradient_checkpointing()
+            # real_score is frozen, but gradients still flow through it to generator inputs.
+            # Enabling checkpointing here reduces activation memory in its forward pass.
+            self.real_score.enable_gradient_checkpointing()
 
         # this will be init later with fsdp-wrapped modules
         self.inference_pipeline: SelfForcingTrainingPipeline = None

@@ -31,7 +31,7 @@ class CausalDiffusion(BaseModel):
         # Noise augmentation in teacher forcing, we add small noise to clean context latents
         self.noise_augmentation_max_timestep = getattr(args, "noise_augmentation_max_timestep", 0)
 
-    def _initialize_models(self, args):
+    def _initialize_models(self, args, device):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
@@ -40,6 +40,9 @@ class CausalDiffusion(BaseModel):
 
         self.vae = WanVAEWrapper()
         self.vae.requires_grad_(False)
+
+        self.scheduler = self.generator.get_scheduler()
+        self.scheduler.timesteps = self.scheduler.timesteps.to(device)
 
     def generator_loss(
         self,

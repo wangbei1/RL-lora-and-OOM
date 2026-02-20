@@ -43,7 +43,7 @@ class ODERegression(BaseModel):
         # Step 2: Initialize all hyperparameters
         self.timestep_shift = getattr(args, "timestep_shift", 1.0)
 
-    def _initialize_models(self, args):
+    def _initialize_models(self, args, device):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
@@ -52,6 +52,9 @@ class ODERegression(BaseModel):
 
         self.vae = WanVAEWrapper()
         self.vae.requires_grad_(False)
+
+        self.scheduler = self.generator.get_scheduler()
+        self.scheduler.timesteps = self.scheduler.timesteps.to(device)
 
     @torch.no_grad()
     def _prepare_generator_input(self, ode_latent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
