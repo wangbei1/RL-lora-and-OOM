@@ -166,6 +166,7 @@ class DMDRL(DMD):
             sharding_strategy=getattr(self.args, "sharding_strategy", "full"),
             mixed_precision=getattr(self.args, "mixed_precision", True),
             wrap_strategy="size",
+            cpu_offload=getattr(self.args, "rl_reward_cpu_offload", False),
         )
         print(f"[DMDRL] Reward model FSDP wrapping complete")
 
