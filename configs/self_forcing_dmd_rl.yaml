@@ -113,11 +113,11 @@ rl_reward_ema_decay: 0.99        # EMA decay for reward monitoring statistics (l
 rl_reward_num_frames: 8         # Number of frames to sample for reward model (0 = all frames)
                                  # 21 latent frames -> 84 pixel frames -> sample 10 for reward
                                  # Reduces Qwen2-VL visual tokens by ~8x, attention memory by ~64x
-rl_frame_strategy: full_decode_uniform  # full_decode_uniform | sparse_window_tail
-rl_sparse_num_groups: 4         # For sparse_window_tail: remaining latent frames are split into 4 groups
-rl_sparse_window_back: 4        # For sparse_window_tail: decode [i-4, i] and keep window tail frame
+rl_frame_strategy: full_decode_uniform  # Use full decode + checkpoint + frame sampling
+rl_sparse_num_groups: 4         # Only used by sparse_window_tail
+rl_sparse_window_back: 4        # Only used by sparse_window_tail
 rl_reward_fsdp: true            # Set to true to FSDP-shard the reward model across GPUs
-vae_chunk_size: 1                # Temporal chunk size for VAE decode (0 = no chunking, full checkpoint)
+vae_chunk_size: 0                # 0 = full decode with checkpoint; >0 = chunked decode
                                  # Reward model gradient checkpointing is always enabled (via Qwen2VL API)
 
 # ============================================
