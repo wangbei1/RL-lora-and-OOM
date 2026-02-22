@@ -9,6 +9,38 @@ from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
+def _remap_keys_for_lora(state_dict, lora_model):
+    """
+    Remap non-LoRA checkpoint keys to match a PEFT LoRA-wrapped model.
+
+    PEFT replaces nn.Linear with LoraLinear, which stores the original weight
+    under 'base_layer.weight' instead of 'weight'.  This function detects
+    LoRA-wrapped sub-modules and rewrites keys accordingly, e.g.:
+        'blocks.0.self_attn1.q.weight' -> 'blocks.0.self_attn1.q.base_layer.weight'
+    """
+    # Build a set of module paths that have been LoRA-wrapped (i.e. have base_layer)
+    lora_module_paths = set()
+    for name, mod in lora_model.named_modules():
+        if hasattr(mod, 'base_layer'):
+            lora_module_paths.add(name)
+
+    remapped = {}
+    for k, v in state_dict.items():
+        matched = False
+        for lora_path in lora_module_paths:
+            # Check if this key belongs to a LoRA-wrapped module
+            # e.g. key='blocks.0.self_attn1.q.weight', lora_path='blocks.0.self_attn1.q'
+            if k.startswith(lora_path + '.'):
+                suffix = k[len(lora_path) + 1:]  # e.g. 'weight' or 'bias'
+                new_key = f"{lora_path}.base_layer.{suffix}"
+                remapped[new_key] = v
+                matched = True
+                break
+        if not matched:
+            remapped[k] = v
+    return remapped
+
+
 def load_generator_checkpoint(generator, checkpoint_path):
     """
     Load a checkpoint into WanDiffusionWrapper, handling:
@@ -34,8 +66,9 @@ def load_generator_checkpoint(generator, checkpoint_path):
     ckpt_has_lora = any('base_model.model.' in k for k in state_dict.keys())
 
     if has_lora and not ckpt_has_lora:
-        # Model has LoRA but checkpoint has original keys ¡ú
-        # load into the unwrapped base model directly
+        # Model has LoRA but checkpoint has original keys --
+        # PEFT renames 'weight' -> 'base_layer.weight' for LoRA-wrapped modules,
+        # so we must remap the checkpoint keys to match.
         print("[load_generator_checkpoint] LoRA detected on model; loading into base model")
         base_sd = {}
         prefix = "model."
@@ -44,15 +77,26 @@ def load_generator_checkpoint(generator, checkpoint_path):
                 base_sd[k[len(prefix):]] = v
             else:
                 base_sd[k] = v
-        generator.model.base_model.model.load_state_dict(base_sd, strict=True)
+        target_model = generator.model.base_model.model
+        remapped_sd = _remap_keys_for_lora(base_sd, target_model)
+        target_model.load_state_dict(remapped_sd, strict=False)
+        # Warn about missing base keys (LoRA adapter keys are expected to be missing)
+        expected = set(target_model.state_dict().keys())
+        base_expected = {k for k in expected if 'lora_' not in k}
+        missing = base_expected - set(remapped_sd.keys())
+        if missing:
+            print(f"[load_generator_checkpoint] Warning: {len(missing)} base keys not in checkpoint")
     elif not has_lora and ckpt_has_lora:
-        # Checkpoint has LoRA keys but model is plain ¡ú strip the prefix
+        # Checkpoint has LoRA keys but model is plain -- strip the prefix
         print("[load_generator_checkpoint] Stripping LoRA prefix from checkpoint keys")
         new_sd = {}
         for k, v in state_dict.items():
             new_k = k.replace('base_model.model.', '')
-            if 'lora_' not in new_k:          # drop LoRA adapter weights
-                new_sd[new_k] = v
+            if 'lora_' in new_k:
+                continue  # drop LoRA adapter weights
+            # PEFT stores original weights under 'base_layer.weight'; revert to 'weight'
+            new_k = new_k.replace('.base_layer.', '.')
+            new_sd[new_k] = v
         generator.load_state_dict(new_sd, strict=True)
     else:
         # Keys already match (both have LoRA or neither does)

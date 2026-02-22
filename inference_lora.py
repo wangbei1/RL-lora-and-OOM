@@ -12,7 +12,7 @@ from torchvision.io import write_video
 from tqdm import tqdm
 
 from demo_utils.memory import DynamicSwapInstaller, get_cuda_free_memory_gb, gpu
-from model.base import apply_lora_to_model
+from model.base import apply_lora_to_model, _remap_keys_for_lora
 from pipeline import CausalDiffusionInferencePipeline, CausalInferencePipeline
 from utils.dataset import TextDataset, TextImagePairDataset
 from utils.misc import set_seed
@@ -89,14 +89,20 @@ def _load_generator_weights(pipeline_generator, checkpoint_path: str, use_ema: b
         prefix = "model."
         for k, v in raw_state_dict.items():
             base_sd[k[len(prefix):] if k.startswith(prefix) else k] = v
-        pipeline_generator.model.base_model.model.load_state_dict(base_sd, strict=True)
+        # PEFT renames 'weight' -> 'base_layer.weight' for LoRA-wrapped modules
+        target_model = pipeline_generator.model.base_model.model
+        remapped_sd = _remap_keys_for_lora(base_sd, target_model)
+        target_model.load_state_dict(remapped_sd, strict=False)
     elif not has_lora and ckpt_has_lora:
         print("[inference_lora] Non-LoRA model + LoRA checkpoint detected, dropping LoRA weights")
         stripped_sd = {}
         for k, v in raw_state_dict.items():
             new_k = k.replace("base_model.model.", "")
-            if "lora_" not in new_k:
-                stripped_sd[new_k] = v
+            if "lora_" in new_k:
+                continue  # drop LoRA adapter weights
+            # PEFT stores original weights under 'base_layer.weight'; revert to 'weight'
+            new_k = new_k.replace(".base_layer.", ".")
+            stripped_sd[new_k] = v
         pipeline_generator.load_state_dict(stripped_sd, strict=True)
     else:
         pipeline_generator.load_state_dict(raw_state_dict, strict=True)
