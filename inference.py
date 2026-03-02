@@ -77,6 +77,11 @@ if args.checkpoint_path:
     new_state_dict = {}
     for k, v in raw_dict.items():
         name = k.replace("_fsdp_wrapped_module.", "")
+        # If checkpoint was trained with PEFT LoRA but inference model is plain,
+        # strip PEFT key prefix and ignore adapter-only weights.
+        name = name.replace("base_model.model.", "")
+        if "lora_" in name:
+            continue
         new_state_dict[name] = v
 
     pipeline.generator.load_state_dict(new_state_dict)
