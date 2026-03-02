@@ -18,6 +18,7 @@ import wandb
 import time
 import os
 import numpy as np
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 
 class Trainer:
@@ -318,6 +319,36 @@ class Trainer:
             save_path = os.path.join(checkpoint_dir, "model.pt")
             torch.save(state_dict, save_path)
             print(f"Model saved to {save_path}")
+
+            # Save LoRA adapters as a standalone artifact when LoRA training is enabled.
+            self._save_lora_adapter(checkpoint_dir)
+
+    def _save_lora_adapter(self, checkpoint_dir: str):
+        """
+        Save PEFT LoRA adapters so they can be loaded independently from full checkpoints.
+        """
+        if not getattr(self.config, "use_lora", False):
+            return
+
+        generator = self.model.generator
+        wrapped_generator = generator.module if hasattr(generator, "module") else generator
+        peft_model = getattr(wrapped_generator, "model", None)
+
+        if peft_model is None or not hasattr(peft_model, "save_pretrained"):
+            print("[LoRA] Warning: LoRA enabled but generator model is not a PEFT model; skipping adapter save")
+            return
+
+        lora_dir = os.path.join(checkpoint_dir, "lora_adapter")
+        os.makedirs(lora_dir, exist_ok=True)
+
+        # For FSDP-wrapped generators, gather full params before serializing adapters.
+        if isinstance(generator, FSDP):
+            with FSDP.summon_full_params(generator, writeback=False):
+                peft_model.save_pretrained(lora_dir)
+        else:
+            peft_model.save_pretrained(lora_dir)
+
+        print(f"[LoRA] Adapter saved to {lora_dir}")
 
     def _plot_training_curves(self):
         """
