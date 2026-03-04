@@ -183,6 +183,7 @@ class Trainer:
 
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
+        self.gradient_accumulation_steps = getattr(config, "gradient_accumulation_steps", 1)
         self.previous_time = None
 
     def _init_local_logging(self, config):
@@ -425,80 +426,162 @@ class Trainer:
     def _generate_demo_videos(self, num_videos=20):
         """
         Generate demo videos at the end of training.
-        """
-        if not self.is_main_process:
-            return
 
-        # Read prompts from MovieGenVideoBench.txt
+        ALL distributed processes must call this method together because
+        inference_with_trajectory uses dist.broadcast internally.
+        Only rank-0 writes files to disk.
+
+        Returns:
+            demo_dir path (rank-0) or None (other ranks)
+        """
         prompts_file = "prompts/MovieGenVideoBench.txt"
         if not os.path.exists(prompts_file):
-            print(f"[Warning] Prompts file not found: {prompts_file}, skipping demo video generation")
-            return
+            if self.is_main_process:
+                print(f"[Warning] Prompts file not found: {prompts_file}, skipping demo video generation")
+            return None
 
         with open(prompts_file, "r") as f:
             all_prompts = [line.strip() for line in f if line.strip()]
 
         prompts = all_prompts[:num_videos]
         if len(prompts) == 0:
-            print("[Warning] No prompts found, skipping demo video generation")
-            return
+            if self.is_main_process:
+                print("[Warning] No prompts found, skipping demo video generation")
+            return None
 
-        print(f"[Demo] Generating {len(prompts)} demo videos...")
+        if self.is_main_process:
+            print(f"[Demo] Generating {len(prompts)} demo videos...")
 
-        # Create demo videos directory
-        demo_dir = os.path.join(self.exp_dir, "demo_videos")
-        os.makedirs(demo_dir, exist_ok=True)
+        # Create demo directory (rank-0 only)
+        demo_dir = None
+        if self.is_main_process:
+            demo_dir = os.path.join(self.exp_dir, "demo_videos")
+            os.makedirs(demo_dir, exist_ok=True)
 
-        # Initialize inference pipeline if not exists
-        if not hasattr(self, '_inference_pipeline'):
-            from pipeline import SelfForcingTrainingPipeline
-            self._inference_pipeline = SelfForcingTrainingPipeline(
-                generator=self.model.generator,
-                text_encoder=self.model.text_encoder,
-                vae=self.model.vae,
-                scheduler=self.model.scheduler,
-                denoising_step_list=self.model.denoising_step_list,
-                device=self.device
-            )
-
-        # Generate videos one by one
         try:
             import imageio
         except ImportError:
-            print("[Warning] imageio not available, saving as numpy arrays instead")
             imageio = None
 
+        self.model.eval()
         for i, prompt in enumerate(prompts):
-            print(f"[Demo] Generating video {i+1}/{len(prompts)}: {prompt[:50]}...")
+            if self.is_main_process:
+                print(f"[Demo] Generating video {i+1}/{len(prompts)}: {prompt[:60]}...")
             try:
-                with torch.no_grad():
-                    video = self.generate_video(self._inference_pipeline, [prompt])
-                    video = video[0]  # [T, H, W, C]
+                # All processes participate in generation
+                video_batch = self.generate_video([prompt])  # [B, T, H, W, C] in [0,255]
+                video = video_batch[0]  # [T, H, W, C]
 
-                # Save video
-                if imageio is not None:
-                    video_path = os.path.join(demo_dir, f"video_{i:03d}.mp4")
-                    video_uint8 = video.astype(np.uint8)
-                    imageio.mimwrite(video_path, video_uint8, fps=8, codec='libx264')
-                else:
-                    video_path = os.path.join(demo_dir, f"video_{i:03d}.npy")
-                    np.save(video_path, video)
+                # Only rank-0 saves to disk
+                if self.is_main_process:
+                    if imageio is not None:
+                        video_path = os.path.join(demo_dir, f"video_{i:03d}.mp4")
+                        imageio.mimwrite(video_path, video.astype(np.uint8),
+                                         fps=8, codec='libx264')
+                    else:
+                        video_path = os.path.join(demo_dir, f"video_{i:03d}.npy")
+                        np.save(video_path, video)
 
-                # Save prompt
-                prompt_path = os.path.join(demo_dir, f"video_{i:03d}_prompt.txt")
-                with open(prompt_path, "w") as f:
-                    f.write(prompt)
+                    with open(os.path.join(demo_dir, f"video_{i:03d}_prompt.txt"), "w") as f:
+                        f.write(prompt)
 
             except Exception as e:
-                print(f"[Demo] Error generating video {i}: {e}")
+                if self.is_main_process:
+                    print(f"[Demo] Error generating video {i}: {e}")
                 continue
 
-        print(f"[Demo] Demo videos saved to {demo_dir}")
+        if self.is_main_process:
+            print(f"[Demo] Demo videos saved to {demo_dir}")
+
+        return demo_dir
+
+    def _run_reward_evaluation(self, demo_dir, prompts):
+        """
+        Run VideoAlign reward evaluation (VQ / MQ / TA / Overall) on the generated
+        demo videos and save results to eval_results.csv.
+        Only called by rank-0.
+        """
+        if not self.is_main_process or demo_dir is None:
+            return
+
+        reward_checkpoint = getattr(self.config, "rl_reward_checkpoint", None)
+        if reward_checkpoint is None:
+            print("[Eval] No rl_reward_checkpoint specified, skipping reward evaluation")
+            return
+
+        try:
+            from VideoAlign.inference import VideoVLMRewardInference
+        except ImportError as e:
+            print(f"[Eval] Cannot import VideoVLMRewardInference: {e}")
+            return
+
+        print(f"[Eval] Running VideoAlign reward evaluation on {len(prompts)} videos ...")
+        try:
+            inferencer = VideoVLMRewardInference(
+                reward_checkpoint, device=self.device, dtype=torch.bfloat16
+            )
+        except Exception as e:
+            print(f"[Eval] Failed to load reward model: {e}")
+            return
+
+        results = []
+        for i, prompt in enumerate(prompts):
+            video_path = os.path.join(demo_dir, f"video_{i:03d}.mp4")
+            if not os.path.exists(video_path):
+                continue
+            try:
+                with torch.no_grad():
+                    rewards = inferencer.reward([video_path], [prompt], use_norm=True)
+                r = rewards[0]
+                results.append({
+                    "video": f"video_{i:03d}.mp4",
+                    "prompt": prompt[:120],
+                    "VQ": r["VQ"],
+                    "MQ": r["MQ"],
+                    "TA": r["TA"],
+                    "Overall": r["Overall"],
+                })
+            except Exception as e:
+                print(f"[Eval] Error evaluating video {i}: {e}")
+
+        if results:
+            try:
+                import pandas as pd
+                df = pd.DataFrame(results)
+                eval_path = os.path.join(self.exp_dir, "eval_results.csv")
+                df.to_csv(eval_path, index=False)
+                print(f"[Eval] Results saved to {eval_path}")
+                print(f"[Eval] Mean scores — VQ: {df['VQ'].mean():.4f}  "
+                      f"MQ: {df['MQ'].mean():.4f}  "
+                      f"TA: {df['TA'].mean():.4f}  "
+                      f"Overall: {df['Overall'].mean():.4f}")
+
+                # Also append summary to log file
+                if self.log_file:
+                    with open(self.log_file, "a") as f:
+                        f.write("\n[VideoAlign Reward Evaluation]\n")
+                        f.write(f"VQ: {df['VQ'].mean():.4f}  "
+                                f"MQ: {df['MQ'].mean():.4f}  "
+                                f"TA: {df['TA'].mean():.4f}  "
+                                f"Overall: {df['Overall'].mean():.4f}\n")
+            except Exception as e:
+                print(f"[Eval] Error saving results: {e}")
 
     def _on_training_end(self):
         """
         Actions to perform at the end of training.
+        ALL processes participate in demo video generation (distributed inference).
+        Only rank-0 handles file I/O and evaluation.
         """
+        # --- Step 1: Generate demo videos (all processes must participate) ---
+        num_demo_videos = getattr(self.config, "num_demo_videos", 20)
+        demo_dir = None
+        if num_demo_videos > 0:
+            if self.is_main_process:
+                print(f"\n[Post-training] Generating {num_demo_videos} demo videos...")
+            demo_dir = self._generate_demo_videos(num_videos=num_demo_videos)
+
+        # --- Step 2: Rank-0 only: evaluate, plot, log ---
         if self.is_main_process:
             print("\n" + "=" * 50)
             print("Training completed!")
@@ -508,11 +591,14 @@ class Trainer:
             print("\n[Post-training] Plotting training curves...")
             self._plot_training_curves()
 
-            # Generate demo videos
-            num_demo_videos = getattr(self.config, "num_demo_videos", 20)
-            if num_demo_videos > 0:
-                print(f"\n[Post-training] Generating {num_demo_videos} demo videos...")
-                self._generate_demo_videos(num_videos=num_demo_videos)
+            # Run reward evaluation on generated videos
+            if demo_dir is not None and num_demo_videos > 0:
+                prompts_file = "prompts/MovieGenVideoBench.txt"
+                if os.path.exists(prompts_file):
+                    with open(prompts_file, "r") as pf:
+                        eval_prompts = [l.strip() for l in pf if l.strip()][:num_demo_videos]
+                    print("\n[Post-training] Running VideoAlign reward evaluation...")
+                    self._run_reward_evaluation(demo_dir, eval_prompts)
 
             # Write final summary to log
             if self.log_file:
@@ -580,6 +666,10 @@ class Trainer:
                     initial_latent=image_latent if self.config.i2v else None
                 )
 
+            # Scale loss for gradient accumulation so the effective gradient
+            # magnitude is the same regardless of accumulation_steps.
+            if self.gradient_accumulation_steps > 1:
+                generator_loss = generator_loss / self.gradient_accumulation_steps
             generator_loss.backward()
             generator_grad_norm = self.model.generator.clip_grad_norm_(
                 self.max_grad_norm_generator)
@@ -600,6 +690,8 @@ class Trainer:
             initial_latent=image_latent if self.config.i2v else None
         )
 
+        if self.gradient_accumulation_steps > 1:
+            critic_loss = critic_loss / self.gradient_accumulation_steps
         critic_loss.backward()
         critic_grad_norm = self.model.fake_score.clip_grad_norm_(
             self.max_grad_norm_critic)
@@ -609,35 +701,42 @@ class Trainer:
 
         return critic_log_dict
 
-    def generate_video(self, pipeline, prompts, image=None):
+    def generate_video(self, prompts):
+        """
+        Generate demo videos using the training inference pipeline + VAE decode.
+        Must be called by ALL distributed processes (inference_with_trajectory
+        uses dist.broadcast internally).
+
+        Returns:
+            numpy array [B, T, H, W, C] in range [0, 255], only meaningful on rank-0
+        """
         batch_size = len(prompts)
-        if image is not None:
-            image = image.squeeze(0).unsqueeze(0).unsqueeze(2).to(device="cuda", dtype=torch.bfloat16)
-
-            # Encode the input image as the first latent
-            initial_latent = pipeline.vae.encode_to_latent(image).to(device="cuda", dtype=torch.bfloat16)
-            initial_latent = initial_latent.repeat(batch_size, 1, 1, 1, 1)
-            sampled_noise = torch.randn(
-                [batch_size, self.model.num_training_frames - 1, 16, 60, 104],
-                device="cuda",
-                dtype=self.dtype
-            )
-        else:
-            initial_latent = None
-            sampled_noise = torch.randn(
-                [batch_size, self.model.num_training_frames, 16, 60, 104],
-                device="cuda",
-                dtype=self.dtype
-            )
-
-        video, _ = pipeline.inference(
-            noise=sampled_noise,
-            text_prompts=prompts,
-            return_latents=True,
-            initial_latent=initial_latent
+        sampled_noise = torch.randn(
+            [batch_size, self.model.num_training_frames, 16, 60, 104],
+            device=self.device,
+            dtype=self.dtype
         )
-        current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
-        return current_video
+
+        # Lazily initialise the inference pipeline (same one used during training)
+        if self.model.inference_pipeline is None:
+            self.model._initialize_inference_pipeline()
+
+        with torch.no_grad():
+            conditional_dict = self.model.text_encoder(text_prompts=prompts)
+
+            # Run causal inference to get latents
+            latents, _, _ = self.model.inference_pipeline.inference_with_trajectory(
+                noise=sampled_noise,
+                **conditional_dict,
+            )
+
+            # Decode latents -> pixels  [B, T_pixel, 3, H, W]  range [-1, 1]
+            video = self.model.vae.decode_to_pixel(latents)
+            # Normalise to [0, 1]
+            video = (video * 0.5 + 0.5).clamp(0, 1)
+
+        # [B, T, H, W, C] in [0, 255]
+        return video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
 
     def train(self):
         start_step = self.step
@@ -664,9 +763,10 @@ class Trainer:
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
-                batch = next(self.dataloader)
-                extra = self.fwdbwd_one_step(batch, True)
-                extras_list.append(extra)
+                for _accum in range(self.gradient_accumulation_steps):
+                    batch = next(self.dataloader)
+                    extra = self.fwdbwd_one_step(batch, True)
+                    extras_list.append(extra)
                 generator_log_dict = merge_dict_list(extras_list)
                 self.generator_optimizer.step()
                 if self.generator_ema is not None:
@@ -675,9 +775,10 @@ class Trainer:
             # Train the critic
             self.critic_optimizer.zero_grad(set_to_none=True)
             extras_list = []
-            batch = next(self.dataloader)
-            extra = self.fwdbwd_one_step(batch, False)
-            extras_list.append(extra)
+            for _accum in range(self.gradient_accumulation_steps):
+                batch = next(self.dataloader)
+                extra = self.fwdbwd_one_step(batch, False)
+                extras_list.append(extra)
             critic_log_dict = merge_dict_list(extras_list)
             self.critic_optimizer.step()
 

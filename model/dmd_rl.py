@@ -229,7 +229,9 @@ class DMDRL(DMD):
 
     def _decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode all latent frames to pixel space with gradient checkpointing.
+        Decode all latent frames to pixel space.
+        Each batch item is wrapped in its own gradient checkpoint to reduce
+        peak activation memory during the backward pass.
 
         Args:
             latent: [B, T, C, H, W] full latent tensor (e.g., T=21)
@@ -237,12 +239,22 @@ class DMDRL(DMD):
         Returns:
             pixel_video: [B, T_pixel, C, H, W] decoded video (e.g., T_pixel=81)
         """
-        def _decode(lat):
-            return self.vae.decode_to_pixel(lat)
+        batch_size = latent.shape[0]
+        if batch_size == 1:
+            # Single-item fast path: one checkpoint wrapping the whole decode
+            def _decode(lat):
+                return self.vae.decode_to_pixel(lat)
+            return checkpoint_utils.checkpoint(_decode, latent, use_reentrant=False)
 
-        return checkpoint_utils.checkpoint(
-            _decode, latent, use_reentrant=False
-        )
+        # Multi-item path: checkpoint each item independently to cap peak memory
+        chunks = []
+        for i in range(batch_size):
+            single = latent[i:i + 1]  # keep batch dim: [1, T, C, H, W]
+            def _decode_single(lat):
+                return self.vae.decode_to_pixel(lat)
+            decoded = checkpoint_utils.checkpoint(_decode_single, single, use_reentrant=False)
+            chunks.append(decoded)
+        return torch.cat(chunks, dim=0)
 
     def compute_rl_loss(
         self,
