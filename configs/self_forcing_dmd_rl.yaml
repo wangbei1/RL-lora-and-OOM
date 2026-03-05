@@ -23,7 +23,7 @@ fake_score_fsdp_wrap_strategy: size
 text_encoder_fsdp_wrap_strategy: size
 
 # Model names
-real_name: Wan2.1-T2V-14B
+real_name: Wan2.1-T2V-1.3B
 
 # Denoising configuration
 denoising_step_list:
@@ -134,7 +134,8 @@ output_dir: output                   # Base directory for experiment logs
 
 # Experiment naming and training control
 exp_name: rl_lora_test          # Experiment name for folder naming (replaces config name)
-max_training_steps: 1000            # Maximum training steps (null for unlimited)
+max_training_steps: 500             # Maximum training steps per run
+gradient_accumulation_steps: 1      # Accumulate gradients over N batches before optimizer.step()
 num_demo_videos: 20                  # Number of demo videos to generate after training (0 to disable)
 
 # Self-forcing specific

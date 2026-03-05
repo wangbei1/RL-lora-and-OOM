@@ -104,7 +104,7 @@ class WanVAEWrapper(torch.nn.Module):
 
         output = []
         for u in zs:
-            output.append(decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0))
+            output.append(decode_function(u.unsqueeze(0), scale).float().clamp(-1, 1).squeeze(0))
         output = torch.stack(output, dim=0)
         # from [batch_size, num_channels, num_frames, height, width]
         # to [batch_size, num_frames, num_channels, height, width]

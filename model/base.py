@@ -50,7 +50,9 @@ def load_generator_checkpoint(generator, checkpoint_path):
         print("[load_generator_checkpoint] Stripping LoRA prefix from checkpoint keys")
         new_sd = {}
         for k, v in state_dict.items():
-            new_k = k.replace('base_model.model.', '')
+            # e.g. 'model.base_model.model.blocks.0.attn.q_proj.base_layer.weight'
+            #   -> 'model.blocks.0.attn.q_proj.weight'
+            new_k = k.replace('base_model.model.', '').replace('.base_layer', '')
             if 'lora_' not in new_k:          # drop LoRA adapter weights
                 new_sd[new_k] = v
         generator.load_state_dict(new_sd, strict=True)
