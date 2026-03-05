@@ -115,8 +115,10 @@ class Trainer:
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
 
-        # VAE is needed for: visualization, raw video loading, or dmd_rl (RL reward computation)
-        if not config.no_visualize or config.load_raw_video or config.distribution_loss == "dmd_rl":
+        # VAE is needed for: visualization, raw video loading, dmd_rl (RL reward computation),
+        # or checkpoint video generation
+        self.checkpoint_num_videos = getattr(config, "checkpoint_num_videos", 0)
+        if not config.no_visualize or config.load_raw_video or config.distribution_loss == "dmd_rl" or self.checkpoint_num_videos > 0:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
@@ -200,6 +202,12 @@ class Trainer:
             "rl_loss": [],
             "rl_reward_raw": [],
             "rl_reward_normalized": [],
+            # Reward Forcing specific
+            "rf_weight": [],
+            "rf_reward_VQ": [],
+            "rf_reward_MQ": [],
+            "rf_reward_TA": [],
+            "rf_reward_overall": [],
         }
 
         if not self.is_main_process:
@@ -229,7 +237,9 @@ class Trainer:
             f.write(f"Max training steps: {getattr(config, 'max_training_steps', 'unlimited')}\n")
             f.write("=" * 80 + "\n")
             # Write column headers
-            if config.distribution_loss == "dmd_rl":
+            if config.distribution_loss == "dmd_rl" and getattr(config, "reward_forcing", False):
+                f.write(f"{'step':>8} | {'dmd_loss':>10} | {'rf_weight':>10} | {'VQ':>6} {'MQ':>6} {'TA':>6} {'OA':>6} | {'total_loss':>12}\n")
+            elif config.distribution_loss == "dmd_rl":
                 f.write(f"{'step':>8} | {'dmd_loss':>10} | {'rl_loss':>10} | {'reward_raw':>12} | {'reward_norm':>12} | {'total_loss':>12} | {'rl_enabled':>10}\n")
             else:
                 f.write(f"{'step':>8} | {'generator_loss':>14} | {'critic_loss':>12}\n")
@@ -245,7 +255,28 @@ class Trainer:
         # Store in history for plotting
         self.training_history["steps"].append(step)
 
-        if self.config.distribution_loss == "dmd_rl":
+        is_reward_forcing = generator_log_dict.get("reward_forcing", False)
+
+        if self.config.distribution_loss == "dmd_rl" and is_reward_forcing:
+            # Reward Forcing mode logging
+            dmd_loss = generator_log_dict.get("dmd_loss", 0.0)
+            total_loss = generator_log_dict.get("total_generator_loss", 0.0)
+            rf_weight = generator_log_dict.get("rf_weight", 1.0)
+            rf_vq = generator_log_dict.get("rf_reward_VQ", 0.0)
+            rf_mq = generator_log_dict.get("rf_reward_MQ", 0.0)
+            rf_ta = generator_log_dict.get("rf_reward_TA", 0.0)
+            rf_overall = generator_log_dict.get("rf_reward_overall", 0.0)
+
+            self.training_history["dmd_loss"].append(dmd_loss)
+            self.training_history["generator_loss"].append(total_loss)
+            self.training_history["rf_weight"].append(rf_weight)
+            self.training_history["rf_reward_VQ"].append(rf_vq)
+            self.training_history["rf_reward_MQ"].append(rf_mq)
+            self.training_history["rf_reward_TA"].append(rf_ta)
+            self.training_history["rf_reward_overall"].append(rf_overall)
+
+        elif self.config.distribution_loss == "dmd_rl":
+            # Differentiable RL mode logging
             dmd_loss = generator_log_dict.get("dmd_loss", 0.0)
             rl_loss = generator_log_dict.get("rl_loss", 0.0)
             reward_raw = generator_log_dict.get("rl_reward_raw", 0.0)
@@ -273,7 +304,11 @@ class Trainer:
             return
 
         with open(self.log_file, "a") as f:
-            if self.config.distribution_loss == "dmd_rl":
+            if self.config.distribution_loss == "dmd_rl" and is_reward_forcing:
+                f.write(f"{step:>8} | dmd={dmd_loss:.4f} | w={rf_weight:.4f} | "
+                        f"VQ={rf_vq:.3f} MQ={rf_mq:.3f} TA={rf_ta:.3f} "
+                        f"OA={rf_overall:.3f} | total={total_loss:.4f}\n")
+            elif self.config.distribution_loss == "dmd_rl":
                 dmd_loss = generator_log_dict.get("dmd_loss", 0.0)
                 rl_loss = generator_log_dict.get("rl_loss", 0.0)
                 reward_raw = generator_log_dict.get("rl_reward_raw", 0.0)
@@ -339,8 +374,71 @@ class Trainer:
         if len(steps) == 0:
             return
 
+        # Check if this is reward_forcing mode
+        is_rf = getattr(self.config, "reward_forcing", False)
+
         # Create figure with subplots
-        if self.config.distribution_loss == "dmd_rl":
+        if self.config.distribution_loss == "dmd_rl" and is_rf:
+            # Reward Forcing plots: 2x3 grid
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+            # Plot DMD Loss
+            if self.training_history["dmd_loss"]:
+                axes[0, 0].plot(steps, self.training_history["dmd_loss"], label='DMD Loss')
+                axes[0, 0].set_xlabel('Step')
+                axes[0, 0].set_ylabel('Loss')
+                axes[0, 0].set_title('DMD Loss')
+                axes[0, 0].legend()
+                axes[0, 0].grid(True)
+
+            # Plot Reward Weight
+            if self.training_history["rf_weight"]:
+                axes[0, 1].plot(steps, self.training_history["rf_weight"], label='exp(beta*r)', color='orange')
+                axes[0, 1].set_xlabel('Step')
+                axes[0, 1].set_ylabel('Weight')
+                axes[0, 1].set_title('Reward Forcing Weight')
+                axes[0, 1].legend()
+                axes[0, 1].grid(True)
+
+            # Plot Total Generator Loss (weighted)
+            if self.training_history["generator_loss"]:
+                axes[0, 2].plot(steps, self.training_history["generator_loss"], label='Total Loss', color='green')
+                axes[0, 2].set_xlabel('Step')
+                axes[0, 2].set_ylabel('Loss')
+                axes[0, 2].set_title('Total Generator Loss (w*dmd)')
+                axes[0, 2].legend()
+                axes[0, 2].grid(True)
+
+            # Plot individual reward scores
+            if self.training_history["rf_reward_VQ"]:
+                axes[1, 0].plot(steps, self.training_history["rf_reward_VQ"], label='VQ', color='blue')
+                axes[1, 0].plot(steps, self.training_history["rf_reward_MQ"], label='MQ', color='red')
+                axes[1, 0].plot(steps, self.training_history["rf_reward_TA"], label='TA', color='green')
+                axes[1, 0].set_xlabel('Step')
+                axes[1, 0].set_ylabel('Score (normalized)')
+                axes[1, 0].set_title('Reward Scores (VQ/MQ/TA)')
+                axes[1, 0].legend()
+                axes[1, 0].grid(True)
+
+            # Plot overall reward
+            if self.training_history["rf_reward_overall"]:
+                axes[1, 1].plot(steps, self.training_history["rf_reward_overall"], label='Overall', color='purple')
+                axes[1, 1].set_xlabel('Step')
+                axes[1, 1].set_ylabel('Score (normalized)')
+                axes[1, 1].set_title('Overall Reward')
+                axes[1, 1].legend()
+                axes[1, 1].grid(True)
+
+            # Plot Critic Loss
+            if self.training_history["critic_loss"]:
+                axes[1, 2].plot(steps, self.training_history["critic_loss"], label='Critic Loss', color='brown')
+                axes[1, 2].set_xlabel('Step')
+                axes[1, 2].set_ylabel('Loss')
+                axes[1, 2].set_title('Critic Loss')
+                axes[1, 2].legend()
+                axes[1, 2].grid(True)
+
+        elif self.config.distribution_loss == "dmd_rl":
             fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
             # Plot DMD Loss
@@ -422,6 +520,72 @@ class Trainer:
         plt.savefig(plot_path, dpi=150)
         plt.close()
         print(f"[Plotting] Training curves saved to {plot_path}")
+
+    def _generate_checkpoint_videos(self, num_videos=5):
+        """
+        Generate a small number of videos at checkpoint save time for quick quality checks.
+
+        ALL distributed processes must participate (inference uses dist.broadcast).
+        Only rank-0 writes files to disk.
+
+        Returns:
+            checkpoint_video_dir path (rank-0) or None (other ranks)
+        """
+        prompts_file = "prompts/MovieGenVideoBench.txt"
+        if not os.path.exists(prompts_file):
+            if self.is_main_process:
+                print(f"[Checkpoint] Prompts file not found: {prompts_file}, skipping checkpoint videos")
+            return None
+
+        with open(prompts_file, "r") as f:
+            all_prompts = [line.strip() for line in f if line.strip()]
+
+        prompts = all_prompts[:num_videos]
+        if len(prompts) == 0:
+            return None
+
+        if self.is_main_process:
+            print(f"[Checkpoint] Generating {len(prompts)} checkpoint videos at step {self.step}...")
+
+        # Create checkpoint video directory (rank-0 only)
+        ckpt_video_dir = None
+        if self.is_main_process:
+            save_dir = self.exp_dir if self.exp_dir else self.output_path
+            ckpt_video_dir = os.path.join(save_dir, f"checkpoint_model_{self.step:06d}", "videos")
+            os.makedirs(ckpt_video_dir, exist_ok=True)
+
+        try:
+            import imageio
+        except ImportError:
+            imageio = None
+
+        self.model.eval()
+        for i, prompt in enumerate(prompts):
+            try:
+                video_batch = self.generate_video([prompt])  # [B, T, H, W, C] in [0,255]
+                video = video_batch[0]  # [T, H, W, C]
+
+                if self.is_main_process:
+                    if imageio is not None:
+                        video_path = os.path.join(ckpt_video_dir, f"video_{i:03d}.mp4")
+                        imageio.mimwrite(video_path, video.astype(np.uint8),
+                                         fps=8, codec='libx264')
+                    else:
+                        video_path = os.path.join(ckpt_video_dir, f"video_{i:03d}.npy")
+                        np.save(video_path, video)
+
+                    with open(os.path.join(ckpt_video_dir, f"video_{i:03d}_prompt.txt"), "w") as f:
+                        f.write(prompt)
+
+            except Exception as e:
+                if self.is_main_process:
+                    print(f"[Checkpoint] Error generating video {i}: {e}")
+                continue
+
+        if self.is_main_process:
+            print(f"[Checkpoint] Videos saved to {ckpt_video_dir}")
+
+        return ckpt_video_dir
 
     def _generate_demo_videos(self, num_videos=20):
         """
@@ -790,10 +954,13 @@ class Trainer:
                     (self.generator_ema is None) and (self.config.ema_weight > 0):
                 self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
 
-            # Save the model
+            # Save the model and optionally generate checkpoint videos
             if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
                 torch.cuda.empty_cache()
                 self.save()
+                # Generate checkpoint videos (all processes participate)
+                if self.checkpoint_num_videos > 0:
+                    self._generate_checkpoint_videos(num_videos=self.checkpoint_num_videos)
                 torch.cuda.empty_cache()
 
             # Logging
@@ -813,12 +980,22 @@ class Trainer:
                         rl_metrics = [
                             "rl_loss", "rl_reward_raw", "rl_reward_normalized",
                             "rl_reward_ema_mean", "rl_reward_ema_std", "rl_enabled",
-                            "dmd_loss", "total_generator_loss"
+                            "dmd_loss", "total_generator_loss",
+                            # Reward Forcing metrics
+                            "rf_weight", "rf_beta_x_score",
+                            "rf_reward_VQ", "rf_reward_MQ", "rf_reward_TA",
+                            "rf_reward_overall", "rf_reward_VQ_raw", "rf_reward_MQ_raw",
+                            "rf_reward_TA_raw", "rf_selected_score",
                         ]
                         for key in rl_metrics:
                             if key in generator_log_dict:
                                 value = generator_log_dict[key]
-                                wandb_loss_dict[key] = float(value) if isinstance(value, bool) else value
+                                if isinstance(value, bool):
+                                    wandb_loss_dict[key] = float(value)
+                                elif isinstance(value, str):
+                                    pass  # skip string values for wandb
+                                else:
+                                    wandb_loss_dict[key] = value
 
                 wandb_loss_dict.update(
                     {

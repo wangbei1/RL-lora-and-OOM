@@ -4,7 +4,19 @@ DMD + RL (Reinforcement Learning) Model
 This module implements the combination of Distribution Matching Distillation (DMD)
 with Reinforcement Learning from video reward models.
 
-Loss: loss_gen = dmd_loss + rl_loss_weight * rl_loss
+Two RL modes are supported:
+
+1. **Differentiable RL** (default, reward_forcing=false):
+   Loss: loss_gen = dmd_loss + rl_loss_weight * (-reward)
+   Gradients flow through the reward model back to the generator.
+
+2. **Reward Forcing** (reward_forcing=true):
+   Loss: loss_gen = exp(beta * reward) * dmd_loss
+   Reward is computed with NO gradient (pure scalar weight on DMD loss).
+   Inspired by: "Reward Forcing" (https://arxiv.org/abs/2512.04678)
+   - Much lower VRAM (no reward model gradient chain)
+   - No need for FSDP on reward model or gradient checkpointing
+   - Supports per-dimension weighting: VQ, MQ, TA, overall, or all (logs all 4)
 
 Features:
 - RL loss computed from VAE-decoded videos using DifferentiableVideoReward
@@ -20,6 +32,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint_utils
 from typing import Optional, Tuple
+import math
 
 from model.dmd import DMD
 
@@ -42,7 +55,7 @@ class DMDRL(DMD):
         self.rl_reward_checkpoint = getattr(args, "rl_reward_checkpoint", None)
         self.rl_target_height = getattr(args, "rl_target_height", 336)  # Must be multiple of 28
         self.rl_target_width = getattr(args, "rl_target_width", 504)    # Must be multiple of 28
-        self.rl_reward_type = getattr(args, "rl_reward_type", "overall")  # VQ, MQ, TA, or overall
+        self.rl_reward_type = getattr(args, "rl_reward_type", "overall")  # VQ, MQ, TA, overall
 
         # Memory optimization options
         self.rl_reward_fsdp = getattr(args, "rl_reward_fsdp", False)
@@ -63,6 +76,21 @@ class DMDRL(DMD):
         self.rl_reward_ema_std = 1.0
         self.rl_reward_ema_decay = getattr(args, "rl_reward_ema_decay", 0.99)
         self._reward_stats_initialized = False
+
+        # =============================================
+        # Reward Forcing mode (no-grad reward weighting)
+        # =============================================
+        self.reward_forcing = getattr(args, "reward_forcing", False)
+        self.reward_forcing_beta = getattr(args, "reward_forcing_beta", 2.0)
+        # Which score to use for weighting: "VQ", "MQ", "TA", "overall", or "all"
+        # "all" means use overall for weighting but log all individual scores too
+        self.reward_forcing_score_type = getattr(args, "reward_forcing_score_type", "overall")
+
+        if self.reward_forcing:
+            print(f"[DMDRL] Reward Forcing mode ENABLED: beta={self.reward_forcing_beta}, "
+                  f"score_type={self.reward_forcing_score_type}")
+            print(f"[DMDRL] Reward is a NO-GRAD scalar weight on DMD loss: "
+                  f"loss = exp(beta * reward) * dmd_loss")
 
         # Validate target dimensions
         assert self.rl_target_height % 28 == 0, f"rl_target_height must be multiple of 28, got {self.rl_target_height}"
@@ -93,24 +121,27 @@ class DMDRL(DMD):
         )
 
         # Freeze reward model parameters
-        # Gradients can still flow THROUGH the reward model back to generator
         self._reward_model.inferencer.model.requires_grad_(False)
 
-        # Enable gradient checkpointing on the reward model (Qwen2VL supports this)
-        # This trades compute for memory: intermediate activations are freed during
-        # forward and recomputed during backward
-        reward_qwen_model = self._reward_model.inferencer.model
-        if hasattr(reward_qwen_model, 'gradient_checkpointing_enable'):
-            reward_qwen_model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-            print(f"[DMDRL] Reward model gradient checkpointing enabled")
+        if self.reward_forcing:
+            # Reward Forcing mode: no gradient through reward model at all
+            # Skip gradient checkpointing and FSDP (not needed, saves memory)
+            print(f"[DMDRL] Reward Forcing: reward model in pure eval/no-grad mode")
         else:
-            print(f"[DMDRL] Warning: reward model does not support gradient_checkpointing_enable")
+            # Differentiable RL: gradients flow THROUGH the frozen reward model
+            # Enable gradient checkpointing on the reward model (Qwen2VL supports this)
+            reward_qwen_model = self._reward_model.inferencer.model
+            if hasattr(reward_qwen_model, 'gradient_checkpointing_enable'):
+                reward_qwen_model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+                print(f"[DMDRL] Reward model gradient checkpointing enabled")
+            else:
+                print(f"[DMDRL] Warning: reward model does not support gradient_checkpointing_enable")
 
-        # Optional FSDP wrapping for the reward model
-        if self.rl_reward_fsdp:
-            self._fsdp_wrap_reward_model()
+            # Optional FSDP wrapping for the reward model
+            if self.rl_reward_fsdp:
+                self._fsdp_wrap_reward_model()
 
         # Load normalization stats from inference_config in the checkpoint
         inference_config = self._reward_model.inferencer.inference_config
@@ -256,13 +287,126 @@ class DMDRL(DMD):
             chunks.append(decoded)
         return torch.cat(chunks, dim=0)
 
+    def compute_reward_forcing_weight(
+        self,
+        latent: torch.Tensor,
+        text_prompts: list,
+    ) -> Tuple[float, dict]:
+        """
+        Compute reward weight for Reward Forcing mode (NO gradient).
+
+        The reward is used as a scalar multiplier on DMD loss:
+            loss = exp(beta * reward) * dmd_loss
+
+        Higher reward → larger weight → stronger DMD gradient signal
+        Lower reward → smaller weight → weaker DMD gradient signal
+
+        All computation is done with torch.no_grad().
+
+        Args:
+            latent: Generated latent tensor [B, T, C, H, W]
+            text_prompts: List of text prompts
+
+        Returns:
+            reward_weight: float scalar = exp(beta * score)
+            rf_log_dict: Dictionary containing all reward scores for logging
+        """
+        if not self.rl_enabled or self._reward_model is None:
+            return 1.0, {
+                "rf_weight": 1.0,
+                "rf_reward_VQ": 0.0,
+                "rf_reward_MQ": 0.0,
+                "rf_reward_TA": 0.0,
+                "rf_reward_overall": 0.0,
+                "rl_enabled": False
+            }
+
+        batch_size = latent.shape[0]
+
+        with torch.no_grad():
+            # Decode latent to pixel space (no gradient needed)
+            pixel_video = self.vae.decode_to_pixel(latent)
+
+            all_vq, all_mq, all_ta = [], [], []
+            all_vq_norm, all_mq_norm, all_ta_norm = [], [], []
+
+            for i in range(batch_size):
+                single_video = pixel_video[i]  # [T_decoded, 3, H, W]
+                sampled_video = self._sample_frames(single_video)
+                prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
+
+                raw_logits = self._reward_model.compute_reward_from_vae_output(
+                    vae_output=sampled_video,
+                    prompt=prompt,
+                    target_height=self.rl_target_height,
+                    target_width=self.rl_target_width
+                )  # [1, 3] → VQ, MQ, TA
+
+                # Raw scores
+                vq_raw = raw_logits[0, 0].item()
+                mq_raw = raw_logits[0, 1].item()
+                ta_raw = raw_logits[0, 2].item()
+                all_vq.append(vq_raw)
+                all_mq.append(mq_raw)
+                all_ta.append(ta_raw)
+
+                # Normalized scores
+                normalized = self._normalize_logits(raw_logits)
+                all_vq_norm.append(normalized[0, 0].item())
+                all_mq_norm.append(normalized[0, 1].item())
+                all_ta_norm.append(normalized[0, 2].item())
+
+        # Average across batch
+        avg_vq = sum(all_vq_norm) / len(all_vq_norm)
+        avg_mq = sum(all_mq_norm) / len(all_mq_norm)
+        avg_ta = sum(all_ta_norm) / len(all_ta_norm)
+        avg_overall = avg_vq + avg_mq + avg_ta
+
+        # Select which score to use for weighting
+        score_type = self.reward_forcing_score_type
+        if score_type == "VQ":
+            selected_score = avg_vq
+        elif score_type == "MQ":
+            selected_score = avg_mq
+        elif score_type == "TA":
+            selected_score = avg_ta
+        else:  # "overall" or "all"
+            selected_score = avg_overall
+
+        # Compute weight: exp(beta * score)
+        # Clamp to prevent numerical issues (exp overflow)
+        clamped = max(min(self.reward_forcing_beta * selected_score, 20.0), -20.0)
+        reward_weight = math.exp(clamped)
+
+        # Update EMA for monitoring
+        self._update_reward_stats(selected_score)
+
+        rf_log_dict = {
+            "rf_weight": reward_weight,
+            "rf_beta_x_score": self.reward_forcing_beta * selected_score,
+            "rf_reward_VQ_raw": sum(all_vq) / len(all_vq),
+            "rf_reward_MQ_raw": sum(all_mq) / len(all_mq),
+            "rf_reward_TA_raw": sum(all_ta) / len(all_ta),
+            "rf_reward_VQ": avg_vq,
+            "rf_reward_MQ": avg_mq,
+            "rf_reward_TA": avg_ta,
+            "rf_reward_overall": avg_overall,
+            "rf_score_type": score_type,
+            "rf_selected_score": selected_score,
+            "rl_reward_ema_mean": self.rl_reward_ema_mean,
+            "rl_reward_ema_std": self.rl_reward_ema_std,
+            "rl_enabled": True
+        }
+
+        return reward_weight, rf_log_dict
+
     def compute_rl_loss(
         self,
         latent: torch.Tensor,
         text_prompts: list,
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Compute RL loss from generated latents.
+        Compute RL loss from generated latents (differentiable RL mode).
 
         Pipeline:
         1. Decode all latent frames to pixel space with checkpoint
@@ -382,27 +526,44 @@ class DMDRL(DMD):
             denoised_timestep_to=denoised_timestep_to
         )
 
-        # Step 3: Compute RL loss if enabled
-        if self.rl_enabled and text_prompts is not None:
+        # Step 3: Apply reward - two modes
+        if self.reward_forcing and self.rl_enabled and text_prompts is not None:
+            # === Reward Forcing mode ===
+            # Reward is a NO-GRAD scalar weight on DMD loss
+            reward_weight, rf_log_dict = self.compute_reward_forcing_weight(
+                latent=pred_image,
+                text_prompts=text_prompts
+            )
+            total_loss = reward_weight * dmd_loss
+
+            generator_log_dict = dmd_log_dict.copy()
+            generator_log_dict.update(rf_log_dict)
+            generator_log_dict["dmd_loss"] = dmd_loss.detach().item()
+            generator_log_dict["total_generator_loss"] = total_loss.detach().item()
+            generator_log_dict["reward_forcing"] = True
+
+        elif not self.reward_forcing and self.rl_enabled and text_prompts is not None:
+            # === Differentiable RL mode (original) ===
             rl_loss, rl_log_dict = self.compute_rl_loss(
                 latent=pred_image,
                 text_prompts=text_prompts
             )
+            total_loss = dmd_loss + self.rl_loss_weight * rl_loss
+
+            generator_log_dict = dmd_log_dict.copy()
+            generator_log_dict.update(rl_log_dict)
+            generator_log_dict["dmd_loss"] = dmd_loss.detach().item()
+            generator_log_dict["total_generator_loss"] = total_loss.detach().item()
+            generator_log_dict["rl_loss_weight"] = self.rl_loss_weight
+            generator_log_dict["reward_forcing"] = False
+
         else:
-            rl_loss = torch.tensor(0.0, device=self.device)
-            rl_log_dict = {
-                "rl_loss": 0.0,
-                "rl_reward_mean": 0.0,
-                "rl_enabled": False
-            }
-
-        # Step 4: Combine losses
-        total_loss = dmd_loss + self.rl_loss_weight * rl_loss
-
-        generator_log_dict = dmd_log_dict.copy()
-        generator_log_dict.update(rl_log_dict)
-        generator_log_dict["dmd_loss"] = dmd_loss.detach().item()
-        generator_log_dict["total_generator_loss"] = total_loss.detach().item()
-        generator_log_dict["rl_loss_weight"] = self.rl_loss_weight
+            # === RL not yet enabled (cold start) ===
+            total_loss = dmd_loss
+            generator_log_dict = dmd_log_dict.copy()
+            generator_log_dict["dmd_loss"] = dmd_loss.detach().item()
+            generator_log_dict["total_generator_loss"] = total_loss.detach().item()
+            generator_log_dict["rl_enabled"] = False
+            generator_log_dict["reward_forcing"] = self.reward_forcing
 
         return total_loss, generator_log_dict

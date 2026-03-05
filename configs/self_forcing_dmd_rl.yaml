@@ -111,6 +111,22 @@ vae_chunk_size: 1                # Temporal chunk size for VAE decode (0 = no ch
                                  # Reward model gradient checkpointing is always enabled (via Qwen2VL API)
 
 # ============================================
+# Reward Forcing mode (optional, alternative to differentiable RL)
+# ============================================
+# When enabled, reward is computed WITHOUT gradients and used as a scalar weight
+# on the DMD loss: loss = exp(beta * reward) * dmd_loss
+# This is much lighter on VRAM (no reward model gradient chain needed)
+# Inspired by: https://arxiv.org/abs/2512.04678
+reward_forcing: false              # Set to true to enable Reward Forcing mode
+reward_forcing_beta: 2.0           # Temperature for exp(beta * reward). Higher = more reward-sensitive
+reward_forcing_score_type: overall # Which score to use for weighting:
+                                   #   'VQ', 'MQ', 'TA', 'overall' (VQ+MQ+TA), or 'all' (same as overall)
+                                   # All individual scores (VQ/MQ/TA/overall) are always logged regardless
+
+# Checkpoint video generation
+checkpoint_num_videos: 5           # Number of videos to generate at each checkpoint save (0 to disable)
+
+# ============================================
 # LoRA configuration (optional, for stable training)
 # ============================================
 use_lora: true                  # Set to true to enable LoRA
