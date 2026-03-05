@@ -129,9 +129,10 @@ class Trainer:
                     self.model.vae,
                     sharding_strategy=config.sharding_strategy,
                     mixed_precision=config.mixed_precision,
-                    wrap_strategy=getattr(config, "vae_fsdp_wrap_strategy", "size")
+                    wrap_strategy=getattr(config, "vae_fsdp_wrap_strategy", "size"),
+                    cpu_offload=getattr(config, "vae_cpu_offload", False)
                 )
-                print("[Trainer] VAE wrapped with FSDP")
+                print(f"[Trainer] VAE wrapped with FSDP (cpu_offload={getattr(config, 'vae_cpu_offload', False)})")
 
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.model.generator.parameters()
