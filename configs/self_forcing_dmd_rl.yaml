@@ -107,6 +107,10 @@ rl_reward_num_frames: 8         # Number of frames to sample for reward model (0
                                  # 21 latent frames -> 84 pixel frames -> sample 10 for reward
                                  # Reduces Qwen2-VL visual tokens by ~8x, attention memory by ~64x
 rl_reward_fsdp: true            # Set to true to FSDP-shard the reward model across GPUs
+                                 # Works in both differentiable RL and reward_forcing modes
+vae_fsdp: false                  # Set to true to FSDP-shard the frozen VAE across GPUs
+                                 # Reduces per-GPU VAE weight memory (WanVAE ~600MB) at cost of all-gather overhead
+vae_fsdp_wrap_strategy: size     # FSDP wrap strategy for VAE: 'size' (recommended)
 vae_chunk_size: 1                # Temporal chunk size for VAE decode (0 = no chunking, full checkpoint)
                                  # Reward model gradient checkpointing is always enabled (via Qwen2VL API)
 

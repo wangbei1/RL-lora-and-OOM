@@ -124,9 +124,12 @@ class DMDRL(DMD):
         self._reward_model.inferencer.model.requires_grad_(False)
 
         if self.reward_forcing:
-            # Reward Forcing mode: no gradient through reward model at all
-            # Skip gradient checkpointing and FSDP (not needed, saves memory)
+            # Reward Forcing mode: no gradient through reward model at all.
+            # Gradient checkpointing not needed (no backward through reward model).
+            # FSDP is still useful to shard frozen Qwen2-VL weights across GPUs.
             print(f"[DMDRL] Reward Forcing: reward model in pure eval/no-grad mode")
+            if self.rl_reward_fsdp:
+                self._fsdp_wrap_reward_model()
         else:
             # Differentiable RL: gradients flow THROUGH the frozen reward model
             # Enable gradient checkpointing on the reward model (Qwen2VL supports this)

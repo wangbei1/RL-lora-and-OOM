@@ -122,6 +122,17 @@ class Trainer:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
+            # Optional FSDP wrapping for VAE — shards frozen VAE weights across GPUs to save per-GPU memory.
+            # VAE parameters are frozen so no gradient considerations; FSDP just handles weight sharding.
+            if getattr(config, "vae_fsdp", False):
+                self.model.vae = fsdp_wrap(
+                    self.model.vae,
+                    sharding_strategy=config.sharding_strategy,
+                    mixed_precision=config.mixed_precision,
+                    wrap_strategy=getattr(config, "vae_fsdp_wrap_strategy", "size")
+                )
+                print("[Trainer] VAE wrapped with FSDP")
+
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.model.generator.parameters()
              if param.requires_grad],
