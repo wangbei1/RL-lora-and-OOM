@@ -15,6 +15,11 @@
 # Generator checkpoint (pre-trained)
 generator_ckpt: checkpoints/self_forcing_dmd.pt
 
+# Resume training from a checkpoint saved by this trainer (overrides generator_ckpt if set).
+# Set to a checkpoint directory (e.g. output/20240101_120000_rl_lora_test/checkpoint_model_001000)
+# or directly to a .pt file. Leave empty ("") to start fresh.
+resume_from_checkpoint: ""
+
 
 # FSDP wrap strategies
 generator_fsdp_wrap_strategy: size

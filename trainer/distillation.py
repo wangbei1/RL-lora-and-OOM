@@ -11,6 +11,11 @@ from utils.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    FullStateDictConfig,
+    StateDictType,
+)
 from model import CausVid, DMD, SiD, DMDRL
 from model.base import load_generator_checkpoint
 import torch
@@ -79,8 +84,12 @@ class Trainer:
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
 
         # Load generator checkpoint BEFORE LoRA/FSDP (original key names required)
+        # Skip if resume_from_checkpoint is set — that will restore the full training state.
         if getattr(config, "generator_ckpt", False):
-            load_generator_checkpoint(self.model.generator, config.generator_ckpt)
+            if getattr(config, "resume_from_checkpoint", ""):
+                print("[Init] Skipping generator_ckpt: resume_from_checkpoint will restore model weights")
+            else:
+                load_generator_checkpoint(self.model.generator, config.generator_ckpt)
 
         # Apply LoRA AFTER checkpoint loading but BEFORE FSDP wrapping
         # (PEFT changes state_dict keys; FSDP must shard LoRA params too)
@@ -199,6 +208,106 @@ class Trainer:
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.gradient_accumulation_steps = getattr(config, "gradient_accumulation_steps", 1)
         self.previous_time = None
+
+        # Resume training state from checkpoint if specified
+        resume_ckpt = getattr(config, "resume_from_checkpoint", "")
+        if resume_ckpt:
+            self._resume_from_checkpoint(resume_ckpt)
+
+    def _resume_from_checkpoint(self, ckpt_path):
+        """
+        Resume training from a saved checkpoint.
+
+        Restores: generator weights, critic weights, optimizer states, EMA, and step counter.
+
+        Args:
+            ckpt_path: Path to either a checkpoint directory (containing model.pt)
+                       or directly to a .pt file.
+
+        Notes:
+            - All ranks load the checkpoint from disk (shared filesystem assumed).
+            - Model weights are loaded via FSDP FULL_STATE_DICT context (FSDP reshards automatically).
+            - Optimizer states use FSDP.optim_state_dict_to_load for correct per-rank sharding.
+            - Resumption assumes the same number of GPUs/ranks as when the checkpoint was saved.
+        """
+        # Resolve checkpoint file path
+        if os.path.isdir(ckpt_path):
+            ckpt_file = os.path.join(ckpt_path, "model.pt")
+        else:
+            ckpt_file = ckpt_path
+
+        if not os.path.isfile(ckpt_file):
+            raise FileNotFoundError(f"[Resume] Checkpoint not found: {ckpt_file}")
+
+        if self.is_main_process:
+            print(f"[Resume] Loading checkpoint from {ckpt_file}")
+
+        # All ranks load the checkpoint (shared filesystem — same file for all ranks)
+        ckpt = torch.load(ckpt_file, map_location="cpu")
+
+        # ── Step counter ──────────────────────────────────────────────────────
+        self.step = ckpt.get("step", 0)
+        if self.is_main_process:
+            print(f"[Resume] Restoring from step {self.step}")
+
+        # ── Model weights ─────────────────────────────────────────────────────
+        # FSDP FULL_STATE_DICT context: all ranks provide the full state dict;
+        # FSDP handles re-sharding across GPU ranks automatically.
+        fsdp_load_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        with FSDP.state_dict_type(
+            self.model.generator, StateDictType.FULL_STATE_DICT, fsdp_load_cfg
+        ):
+            self.model.generator.load_state_dict(ckpt["generator"])
+
+        with FSDP.state_dict_type(
+            self.model.fake_score, StateDictType.FULL_STATE_DICT, fsdp_load_cfg
+        ):
+            self.model.fake_score.load_state_dict(ckpt["critic"])
+
+        if self.is_main_process:
+            print("[Resume] Generator and critic weights restored")
+
+        # ── Optimizer states ──────────────────────────────────────────────────
+        # FSDP.optim_state_dict_to_load converts the gathered full optimizer
+        # state dict back into the per-rank sharded form expected by the optimizer.
+        if "generator_optimizer" in ckpt:
+            sharded_gen_osd = FSDP.optim_state_dict_to_load(
+                model=self.model.generator,
+                optim=self.generator_optimizer,
+                optim_state_dict=ckpt["generator_optimizer"],
+            )
+            self.generator_optimizer.load_state_dict(sharded_gen_osd)
+
+        if "critic_optimizer" in ckpt:
+            sharded_critic_osd = FSDP.optim_state_dict_to_load(
+                model=self.model.fake_score,
+                optim=self.critic_optimizer,
+                optim_state_dict=ckpt["critic_optimizer"],
+            )
+            self.critic_optimizer.load_state_dict(sharded_critic_osd)
+
+        if "generator_optimizer" in ckpt and self.is_main_process:
+            print("[Resume] Optimizer states restored")
+
+        # ── EMA ───────────────────────────────────────────────────────────────
+        # Re-create EMA if step has passed ema_start_step (EMA was deleted during __init__
+        # because self.step was 0 at that point).
+        if (
+            self.step >= self.config.ema_start_step
+            and self.generator_ema is None
+            and self.config.ema_weight > 0
+        ):
+            self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+            if self.is_main_process:
+                print(f"[Resume] EMA re-initialized at step {self.step}")
+
+        if "generator_ema" in ckpt and self.generator_ema is not None:
+            self.generator_ema.load_state_dict(ckpt["generator_ema"])
+            if self.is_main_process:
+                print("[Resume] EMA state restored")
+
+        if self.is_main_process:
+            print(f"[Resume] Training will continue from step {self.step}")
 
     def _init_local_logging(self, config):
         """
@@ -346,16 +455,28 @@ class Trainer:
         critic_state_dict = fsdp_state_dict(
             self.model.fake_score)
 
+        # Gather full optimizer states to rank 0 (collective call — all ranks participate)
+        gen_optim_state = FSDP.full_optim_state_dict(
+            self.model.generator, self.generator_optimizer, rank0_only=True)
+        critic_optim_state = FSDP.full_optim_state_dict(
+            self.model.fake_score, self.critic_optimizer, rank0_only=True)
+
         if self.config.ema_start_step < self.step:
             state_dict = {
                 "generator": generator_state_dict,
                 "critic": critic_state_dict,
                 "generator_ema": self.generator_ema.state_dict(),
+                "step": self.step,
+                "generator_optimizer": gen_optim_state,
+                "critic_optimizer": critic_optim_state,
             }
         else:
             state_dict = {
                 "generator": generator_state_dict,
                 "critic": critic_state_dict,
+                "step": self.step,
+                "generator_optimizer": gen_optim_state,
+                "critic_optimizer": critic_optim_state,
             }
 
         if self.is_main_process:
