@@ -65,6 +65,16 @@ class DMDRL(DMD):
         # 0 = no sampling (use all frames)
         self.rl_reward_num_frames = getattr(args, "rl_reward_num_frames", 10)
 
+        # Spatial downscaling of latent BEFORE reward decode.
+        # The decoded pixels are only used for reward scoring; the reward model
+        # will resize them to rl_target_height x rl_target_width anyway.
+        # Downscaling the latent reduces VAE decode memory roughly by scale^2:
+        #   scale=1.0 (default): decode at full 480x832 → 185MB output
+        #   scale=0.5:           decode at 240x416  →  ~46MB output  (4x savings)
+        #   scale=0.25:          decode at 120x208  →  ~12MB output  (16x savings)
+        # NOTE: only applied during reward computation, NOT during generator training.
+        self.vae_reward_spatial_scale = getattr(args, "vae_reward_spatial_scale", 1.0)
+
         # Reward normalization: use inference_config from reward model checkpoint
         # (VQ_mean/std, MQ_mean/std, TA_mean/std) for proper z-score normalization
         # These are loaded lazily when the reward model is initialized
@@ -263,6 +273,29 @@ class DMDRL(DMD):
         indices = torch.linspace(0, T - 1, num_frames).round().long()
         return video[indices]
 
+    def _scale_latent_for_reward(self, latent: torch.Tensor) -> torch.Tensor:
+        """
+        Optionally downscale latent spatial dimensions before VAE decode for
+        reward computation. Has no effect on generator training.
+
+        Latent: [B, T, C, H, W]  (H=60, W=104 for standard 480p video)
+        After scale=0.5: H=30, W=52 → decoded pixels 240x416 (vs 480x832)
+
+        The reward model resizes to rl_target_height x rl_target_width anyway,
+        so lower-res pixels don't degrade reward signal meaningfully.
+        """
+        scale = self.vae_reward_spatial_scale
+        if scale >= 1.0:
+            return latent
+        B, T, C, H, W = latent.shape
+        new_H = max(int(H * scale), 4)
+        new_W = max(int(W * scale), 4)
+        # interpolate over spatial dims; flatten B,T for F.interpolate
+        x = latent.flatten(0, 1)           # [B*T, C, H, W]
+        x = F.interpolate(x.float(), size=(new_H, new_W),
+                          mode='bilinear', align_corners=False).to(latent.dtype)
+        return x.unflatten(0, (B, T))      # [B, T, C, new_H, new_W]
+
     def _decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """
         Decode all latent frames to pixel space.
@@ -329,8 +362,10 @@ class DMDRL(DMD):
         batch_size = latent.shape[0]
 
         with torch.no_grad():
-            # Decode latent to pixel space (no gradient needed)
-            pixel_video = self.vae.decode_to_pixel(latent)
+            # Optionally downscale latent before decode to save VAE decode memory.
+            # Reward model resizes to rl_target_height x rl_target_width anyway.
+            scaled_latent = self._scale_latent_for_reward(latent)
+            pixel_video = self.vae.decode_to_pixel(scaled_latent)
 
             all_vq, all_mq, all_ta = [], [], []
             all_vq_norm, all_mq_norm, all_ta_norm = [], [], []
@@ -438,8 +473,9 @@ class DMDRL(DMD):
 
         batch_size = latent.shape[0]
 
-        # Step 1: Decode all latent frames to pixel space with checkpoint
-        pixel_video = self._decode_latent(latent)
+        # Step 1: Decode all latent frames to pixel space with checkpoint.
+        # Optionally downscale latent first to reduce decode memory.
+        pixel_video = self._decode_latent(self._scale_latent_for_reward(latent))
 
         # Compute rewards for each sample in the batch
         total_reward = 0.0

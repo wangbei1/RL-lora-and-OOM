@@ -103,6 +103,7 @@ rl_reward_checkpoint: VideoAlign/checkpoints
 rl_target_height: 336
 rl_target_width: 504
 rl_reward_num_frames: 8
+vae_reward_spatial_scale: 1.0   # 0.5 = decode at 240x416 instead of 480x832 (~4x less VAE decode mem)
 rl_reward_fsdp: true                # Still useful: shards Qwen2-VL weights across GPUs even without gradients
 rl_reward_cpu_offload: false        # Set to true to offload reward model to CPU (saves ~14GB GPU per card)
 vae_fsdp: false                     # Set to true to FSDP-shard the frozen VAE across GPUs
