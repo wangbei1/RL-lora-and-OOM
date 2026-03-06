@@ -106,9 +106,6 @@ rl_reward_ema_decay: 0.99        # EMA decay for reward monitoring statistics (l
 rl_reward_num_frames: 8         # Number of frames to sample for reward model (0 = all frames)
                                  # 21 latent frames -> 84 pixel frames -> sample 10 for reward
                                  # Reduces Qwen2-VL visual tokens by ~8x, attention memory by ~64x
-vae_reward_spatial_scale: 1.0   # Downscale latent spatial dims BEFORE reward-only VAE decode
-                                 # Applied only during reward scoring, NOT generator training
-                                 # 1.0=full 480x832, 0.5=240x416 (~4x less decode mem), 0.25=120x208 (~16x)
 rl_reward_fsdp: true            # Set to true to FSDP-shard the reward model across GPUs
                                  # Works in both differentiable RL and reward_forcing modes
 rl_reward_cpu_offload: false     # Set to true to offload reward model params to CPU (FSDP CPUOffload)
