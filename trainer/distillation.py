@@ -95,6 +95,16 @@ class Trainer:
         # (PEFT changes state_dict keys; FSDP must shard LoRA params too)
         self.model._apply_lora_if_enabled(config)
 
+        # Move VAE to GPU BEFORE FSDP wrapping of other modules.
+        # VAE is initialized with torch.device('meta') + assign=True, which can interact
+        # unexpectedly with FSDP's use_orig_params=True on some ranks if moved after FSDP init.
+        self.checkpoint_num_videos = getattr(config, "checkpoint_num_videos", 0)
+        vae_needed = (not config.no_visualize or config.load_raw_video
+                      or config.distribution_loss == "dmd_rl" or self.checkpoint_num_videos > 0)
+        if vae_needed:
+            self.model.vae = self.model.vae.to(
+                device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
+
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
@@ -124,24 +134,17 @@ class Trainer:
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
 
-        # VAE is needed for: visualization, raw video loading, dmd_rl (RL reward computation),
-        # or checkpoint video generation
-        self.checkpoint_num_videos = getattr(config, "checkpoint_num_videos", 0)
-        if not config.no_visualize or config.load_raw_video or config.distribution_loss == "dmd_rl" or self.checkpoint_num_videos > 0:
-            self.model.vae = self.model.vae.to(
-                device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
-
-            # Optional FSDP wrapping for VAE — shards frozen VAE weights across GPUs to save per-GPU memory.
-            # VAE parameters are frozen so no gradient considerations; FSDP just handles weight sharding.
-            if getattr(config, "vae_fsdp", False):
-                self.model.vae = fsdp_wrap(
-                    self.model.vae,
-                    sharding_strategy=config.sharding_strategy,
-                    mixed_precision=config.mixed_precision,
-                    wrap_strategy=getattr(config, "vae_fsdp_wrap_strategy", "size"),
-                    cpu_offload=getattr(config, "vae_cpu_offload", False)
-                )
-                print(f"[Trainer] VAE wrapped with FSDP (cpu_offload={getattr(config, 'vae_cpu_offload', False)})")
+        # Optional FSDP wrapping for VAE — shards frozen VAE weights across GPUs to save per-GPU memory.
+        # VAE parameters are frozen so no gradient considerations; FSDP just handles weight sharding.
+        if vae_needed and getattr(config, "vae_fsdp", False):
+            self.model.vae = fsdp_wrap(
+                self.model.vae,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=getattr(config, "vae_fsdp_wrap_strategy", "size"),
+                cpu_offload=getattr(config, "vae_cpu_offload", False)
+            )
+            print(f"[Trainer] VAE wrapped with FSDP (cpu_offload={getattr(config, 'vae_cpu_offload', False)})")
 
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.model.generator.parameters()
