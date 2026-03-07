@@ -362,7 +362,7 @@ class DMDRL(DMD):
         elif score_type == "TA":
             delta = delta_ta
         else:  # "overall" or "all"
-            delta = delta_vq + delta_mq + delta_ta
+            delta = (delta_vq + delta_mq + delta_ta) / 3.0
 
         self._update_delta_ema(avg_vq, avg_mq, avg_ta)
         return delta
@@ -464,7 +464,7 @@ class DMDRL(DMD):
         avg_vq = sum(all_vq_norm) / len(all_vq_norm)
         avg_mq = sum(all_mq_norm) / len(all_mq_norm)
         avg_ta = sum(all_ta_norm) / len(all_ta_norm)
-        avg_overall = avg_vq + avg_mq + avg_ta
+        avg_overall = (avg_vq + avg_mq + avg_ta) / 3.0
 
         # Select which score to use for weighting
         score_type = self.reward_forcing_score_type
@@ -578,8 +578,8 @@ class DMDRL(DMD):
                 reward = normalized_logits[0, 2]
                 raw_reward = raw_logits[0, 2].detach().item()
             else:  # overall
-                reward = normalized_logits.sum()
-                raw_reward = raw_logits.sum().detach().item()
+                reward = normalized_logits.mean()
+                raw_reward = raw_logits.mean().detach().item()
 
             reward_value = reward.detach().item()
             raw_rewards_list.append(raw_reward)
