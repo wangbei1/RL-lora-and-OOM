@@ -77,6 +77,22 @@ class DMDRL(DMD):
         self.rl_reward_ema_decay = getattr(args, "rl_reward_ema_decay", 0.99)
         self._reward_stats_initialized = False
 
+        # Frame chunking: split decoded pixel video into temporal chunks, compute reward per chunk
+        # 0 = disabled (use full video with rl_reward_num_frames sampling)
+        # N > 0 = split into N temporal chunks, each sub-sampled to rl_chunk_frames frames
+        self.rl_frame_chunks = getattr(args, "rl_frame_chunks", 0)
+        self.rl_chunk_frames = getattr(args, "rl_chunk_frames", 4)
+
+        # Per-dimension delta EMA baseline (separate from monitoring EMA above)
+        # If rl_use_delta_baseline=True: weight = exp(beta * delta), delta = score - ema_baseline
+        # Uses faster decay (default 0.95) to track recent ~20-step trend
+        self.rl_use_delta_baseline = getattr(args, "rl_use_delta_baseline", False)
+        self.rl_delta_ema_decay = getattr(args, "rl_delta_ema_decay", 0.95)
+        self._delta_ema_vq = 0.0
+        self._delta_ema_mq = 0.0
+        self._delta_ema_ta = 0.0
+        self._delta_ema_initialized = False
+
         # =============================================
         # Reward Forcing mode (no-grad reward weighting)
         # =============================================
@@ -167,8 +183,15 @@ class DMDRL(DMD):
 
         self._reward_model_initialized = True
         print(f"[DMDRL] Reward model initialized and frozen successfully")
-        print(f"[DMDRL] VAE decode: checkpoint(decode(all)), then sample "
-              f"{self.rl_reward_num_frames} pixel frames")
+        if self.rl_frame_chunks > 0:
+            print(f"[DMDRL] Frame chunking ENABLED: {self.rl_frame_chunks} temporal chunks, "
+                  f"{self.rl_chunk_frames} frames/chunk (uniform)")
+        else:
+            print(f"[DMDRL] VAE decode: checkpoint(decode(all)), then sample "
+                  f"{self.rl_reward_num_frames} pixel frames")
+        if self.rl_use_delta_baseline:
+            print(f"[DMDRL] Delta baseline ENABLED: rl_delta_ema_decay={self.rl_delta_ema_decay}, "
+                  f"weight=exp(beta * (score - ema_baseline))")
 
     def _fsdp_wrap_reward_model(self):
         """
@@ -263,6 +286,87 @@ class DMDRL(DMD):
         indices = torch.linspace(0, T - 1, num_frames).round().long()
         return video[indices]
 
+    def _compute_chunked_reward(self, video: torch.Tensor, prompt: str) -> torch.Tensor:
+        """
+        Split video [T, C, H, W] into rl_frame_chunks temporal chunks.
+        Uniformly sample rl_chunk_frames frames from each chunk.
+        Compute reward per chunk and return averaged [1, 3] raw logits.
+
+        Logic: decode first → then split pixel frames → 4 frames per chunk (uniform).
+        Works with or without gradient (controlled by outer torch.no_grad context).
+        """
+        T = video.shape[0]
+        n = self.rl_frame_chunks
+        chunk_size = T // n
+
+        all_logits = []
+        for i in range(n):
+            start = i * chunk_size
+            end = (i + 1) * chunk_size if i < n - 1 else T
+            chunk = video[start:end]  # [chunk_T, C, H, W]
+            sampled = self._sample_frames(chunk, num_frames=self.rl_chunk_frames)
+            raw_logits = self._reward_model.compute_reward_from_vae_output(
+                vae_output=sampled,
+                prompt=prompt,
+                target_height=self.rl_target_height,
+                target_width=self.rl_target_width
+            )  # [1, 3]
+            all_logits.append(raw_logits)
+
+        return torch.stack(all_logits, dim=0).mean(dim=0)  # [1, 3]
+
+    def _get_video_reward(self, video: torch.Tensor, prompt: str) -> torch.Tensor:
+        """
+        Compute reward for a single video [T, C, H, W].
+        Routes to chunked or whole-video mode based on rl_frame_chunks config.
+        Returns [1, 3] raw logits (VQ, MQ, TA).
+        """
+        if self.rl_frame_chunks > 0:
+            return self._compute_chunked_reward(video, prompt)
+        else:
+            sampled = self._sample_frames(video)
+            return self._reward_model.compute_reward_from_vae_output(
+                vae_output=sampled,
+                prompt=prompt,
+                target_height=self.rl_target_height,
+                target_width=self.rl_target_width
+            )
+
+    def _update_delta_ema(self, vq: float, mq: float, ta: float):
+        """Update per-dimension EMA baselines for delta computation."""
+        decay = self.rl_delta_ema_decay
+        if not self._delta_ema_initialized:
+            self._delta_ema_vq = vq
+            self._delta_ema_mq = mq
+            self._delta_ema_ta = ta
+            self._delta_ema_initialized = True
+        else:
+            self._delta_ema_vq = decay * self._delta_ema_vq + (1 - decay) * vq
+            self._delta_ema_mq = decay * self._delta_ema_mq + (1 - decay) * mq
+            self._delta_ema_ta = decay * self._delta_ema_ta + (1 - decay) * ta
+
+    def _get_delta_score(self, avg_vq: float, avg_mq: float, avg_ta: float, score_type: str) -> float:
+        """
+        Compute delta = current_score - ema_baseline for the selected dimension(s).
+        Updates the EMA baseline after computing the delta.
+        Positive delta = improved vs recent history; negative = degraded.
+        """
+        delta_vq = avg_vq - self._delta_ema_vq
+        delta_mq = avg_mq - self._delta_ema_mq
+        delta_ta = avg_ta - self._delta_ema_ta
+
+        if score_type == "VQ":
+            delta = delta_vq
+        elif score_type == "MQ":
+            delta = delta_mq
+        elif score_type == "TA":
+            delta = delta_ta
+        else:  # "overall" or "all"
+            delta = delta_vq + delta_mq + delta_ta
+
+        self._update_delta_ema(avg_vq, avg_mq, avg_ta)
+        return delta
+
     def _decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """
         Decode all latent frames to pixel space.
@@ -337,15 +441,10 @@ class DMDRL(DMD):
 
             for i in range(batch_size):
                 single_video = pixel_video[i]  # [T_decoded, 3, H, W]
-                sampled_video = self._sample_frames(single_video)
                 prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
 
-                raw_logits = self._reward_model.compute_reward_from_vae_output(
-                    vae_output=sampled_video,
-                    prompt=prompt,
-                    target_height=self.rl_target_height,
-                    target_width=self.rl_target_width
-                )  # [1, 3] → VQ, MQ, TA
+                # Route to chunked or whole-video reward based on config
+                raw_logits = self._get_video_reward(single_video, prompt)  # [1, 3] → VQ, MQ, TA
 
                 # Raw scores
                 vq_raw = raw_logits[0, 0].item()
@@ -370,21 +469,28 @@ class DMDRL(DMD):
         # Select which score to use for weighting
         score_type = self.reward_forcing_score_type
         if score_type == "VQ":
-            selected_score = avg_vq
+            abs_score = avg_vq
         elif score_type == "MQ":
-            selected_score = avg_mq
+            abs_score = avg_mq
         elif score_type == "TA":
-            selected_score = avg_ta
+            abs_score = avg_ta
         else:  # "overall" or "all"
-            selected_score = avg_overall
+            abs_score = avg_overall
+
+        # Delta baseline mode: weight on improvement over recent EMA baseline
+        # weight = exp(beta * delta), delta = score - ema_baseline
+        if self.rl_use_delta_baseline:
+            selected_score = self._get_delta_score(avg_vq, avg_mq, avg_ta, score_type)
+        else:
+            selected_score = abs_score
 
         # Compute weight: exp(beta * score)
         # Clamp to prevent numerical issues (exp overflow)
         clamped = max(min(self.reward_forcing_beta * selected_score, 20.0), -20.0)
         reward_weight = math.exp(clamped)
 
-        # Update EMA for monitoring
-        self._update_reward_stats(selected_score)
+        # Update monitoring EMA (always tracks absolute score)
+        self._update_reward_stats(abs_score)
 
         rf_log_dict = {
             "rf_weight": reward_weight,
@@ -398,10 +504,15 @@ class DMDRL(DMD):
             "rf_reward_overall": avg_overall,
             "rf_score_type": score_type,
             "rf_selected_score": selected_score,
+            "rf_use_delta_baseline": self.rl_use_delta_baseline,
             "rl_reward_ema_mean": self.rl_reward_ema_mean,
             "rl_reward_ema_std": self.rl_reward_ema_std,
             "rl_enabled": True
         }
+        if self.rl_use_delta_baseline and self._delta_ema_initialized:
+            rf_log_dict["rf_delta_ema_vq"] = self._delta_ema_vq
+            rf_log_dict["rf_delta_ema_mq"] = self._delta_ema_mq
+            rf_log_dict["rf_delta_ema_ta"] = self._delta_ema_ta
 
         return reward_weight, rf_log_dict
 
@@ -449,17 +560,10 @@ class DMDRL(DMD):
         for i in range(batch_size):
             single_video = pixel_video[i]  # [T_decoded, 3, H, W]
 
-            # Step 2: Sub-sample pixel frames for reward model
-            sampled_video = self._sample_frames(single_video)
-
             prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
 
-            raw_logits = self._reward_model.compute_reward_from_vae_output(
-                vae_output=sampled_video,
-                prompt=prompt,
-                target_height=self.rl_target_height,
-                target_width=self.rl_target_width
-            )
+            # Step 2: Compute reward (chunked or whole-video based on config)
+            raw_logits = self._get_video_reward(single_video, prompt)
 
             # Apply z-score normalization from inference_config (differentiable)
             normalized_logits = self._normalize_logits(raw_logits)
